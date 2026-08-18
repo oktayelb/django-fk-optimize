@@ -15,6 +15,10 @@ class Command(BaseCommand):
             action= "store_true",
             help= "when set includes models not written by the dev"
         )
+
+    def optimize_qs(self, model):
+        pass
+
     def handle (self, *args,**options):
 
 
@@ -41,6 +45,14 @@ class Command(BaseCommand):
 
         #only keep the models that has at least one fk
         model_s = [mdl for mdl in model_s if any(f.is_relation for f in mdl._meta.get_fields())]
-       # else find the more suitable operation (select_related/prefetch)
+
+        if not model_s:
+            self.stdout.write("No model found with a fk field. No  select_related/prefetch optimization can be done.")
+            return
+
+        else:
+            for mdl in model_s:
+                self.optimize_qs(mdl)
+
        # return the results
         
