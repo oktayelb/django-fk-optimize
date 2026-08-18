@@ -12,13 +12,13 @@ class Command(BaseCommand):
         parser.add_argument("--timeout", type=int)
         parser.add_argument(
             "--django-models",
-            action= "select_true",
+            action= "store_true",
             help= "when set includes models not written by the dev"
         )
     def handle (self, *args,**options):
 
 
-        selection :str  = options["app.model"]
+        selection :str | None  = options["app.model"]
         model_s :list[type[Model]] = [] 
 
         try:
