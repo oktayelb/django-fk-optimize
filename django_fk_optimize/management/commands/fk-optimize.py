@@ -16,7 +16,7 @@ class Command(BaseCommand):
             help= "when set includes models not written by the dev"
         )
 
-    def optimize_qs(self, model):
+    def _optimize_qs(self, model):
         pass
 
     def handle (self, *args,**options):
@@ -52,7 +52,7 @@ class Command(BaseCommand):
 
         else:
             for mdl in model_s:
-                self.optimize_qs(mdl)
+                self._optimize_qs(mdl)
 
        # return the results
         
