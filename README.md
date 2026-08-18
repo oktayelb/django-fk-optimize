@@ -31,3 +31,4 @@ After having the  models and access to the actual data, it starts executing mode
 
 
 By default we ignore django models, if you want to include them you have to run with the --django-models flag.
+we only ignore models that begin with django. for the moment. Third party models are not ignored as they can be discarded by the developer.
