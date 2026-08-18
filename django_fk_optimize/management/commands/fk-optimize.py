@@ -40,8 +40,8 @@ class Command(BaseCommand):
                 for mdl in apps.get_app_config(selection).get_models():
                     model_s.append(mdl)
 
-        except LookupError as e:
-            raise CommandError(e)
+        except (LookupError ,ValueError) as e:
+            raise CommandError(str(e)) from e
 
         #only keep the models that has at least one fk
         model_s = [mdl for mdl in model_s if any(f.is_relation for f in mdl._meta.get_fields())]
