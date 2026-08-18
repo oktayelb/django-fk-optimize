@@ -28,7 +28,7 @@ class Command(BaseCommand):
         try:
             if selection is None:
                 model_s = list(apps.get_models())
-                if not options["--django-models"]:
+                if not options["django_models"]:
                     local_apps = {ac.label for ac in apps.get_app_configs()
                             if not ac.name.startswith("django.")}
                     model_s = [mdl for mdl in model_s if mdl._meta.app_label in local_apps]
