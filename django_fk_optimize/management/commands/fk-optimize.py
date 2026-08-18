@@ -13,7 +13,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--django-models",
             action= "store_true",
-            help= "when set includes models not written by the dev"
+            help= "when set includes django (and third party) models"
         )
 
     def _optimize_qs(self, model):
