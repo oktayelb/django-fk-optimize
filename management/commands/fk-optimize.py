@@ -1,6 +1,7 @@
 from django.core.management.base import BaseCommand
 from django.db.models import Model
 from django.apps.registry import apps
+from django.core.management.base import CommandError 
 
 class Command(BaseCommand):
 
@@ -28,14 +29,11 @@ class Command(BaseCommand):
                 for mdl in apps.get_app_config(selection).get_models():
                     model_s.append(mdl)
 
-        except LookupError:
-            print("Couldnt Find Specified Model(s)")
-        
-       #right now eihter we threw an error, 
-       # or model_s has all of the models we need
+        except LookupError as e:
+            raise CommandError(e)
 
-       # for every model:
-       # if  no fk, skip
+        #only keep the models that has at least one fk
+
        # else find the more suitable operation (select_related/prefetch)
        # return the results
         
