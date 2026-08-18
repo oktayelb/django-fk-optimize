@@ -17,17 +17,20 @@ class Command(BaseCommand):
         selection :str  = options["app.model"]
         model_s :list[type[Model]] = [] 
 
-        if selection is None:
-            model_s = list(apps.get_models())
-            
-        elif "." in selection:
-            model_s.append(apps.get_model(selection))
-        else:
-            
-            for mdl in apps.get_app_config(selection).get_models():
-                model_s.append(mdl)
+        try:
+            if selection is None:
+                model_s = list(apps.get_models())
+                
+            elif "." in selection:
+                model_s.append(apps.get_model(selection))
 
+            else:    
+                for mdl in apps.get_app_config(selection).get_models():
+                    model_s.append(mdl)
 
+        except LookupError:
+            print("Couldnt Find Specified Model(s)")
+        
        #right now eihter we threw an error, 
        # or model_s has all of the models we need
 
