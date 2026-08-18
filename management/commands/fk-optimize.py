@@ -32,7 +32,7 @@ class Command(BaseCommand):
             raise CommandError(e)
 
         #only keep the models that has at least one fk
-
+        model_s = [mdl for mdl in model_s if any(f.is_relation for f in mdl._meta.get_fields())]
        # else find the more suitable operation (select_related/prefetch)
        # return the results
         
