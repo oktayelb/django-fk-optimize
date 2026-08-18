@@ -20,12 +20,12 @@ class Command(BaseCommand):
 
         for field in model._meta.get_fields():
             if field.is_relation:
-                self._optimize_realation(model, field)
+                self._optimize_relation(model, field)
 
         #combine and try for the combined version as well.
         pass
 
-    def _optimize_realation(self, model, field):
+    def _optimize_relation(self, model, field):
         pass
 
     def handle (self, *args,**options):
