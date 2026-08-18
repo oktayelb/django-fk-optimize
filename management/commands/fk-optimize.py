@@ -11,7 +11,7 @@ class Command(BaseCommand):
         parser.add_argument("app.model", nargs="?", type=str , default= None)
         parser.add_argument("--timeout", type=int)
         parser.add_argument(
-            "--all-apps",
+            "--django-models",
             action= "select_true",
             help= "when set includes models not written by the dev"
         )
@@ -24,7 +24,7 @@ class Command(BaseCommand):
         try:
             if selection is None:
                 model_s = list(apps.get_models())
-                if not options["--all-apps"]:
+                if not options["--django-models"]:
                     local_apps = {ac.label for ac in apps.get_app_configs()
                             if not ac.name.startswith("django.")}
                     model_s = [mdl for mdl in model_s if mdl._meta.app_label in local_apps]

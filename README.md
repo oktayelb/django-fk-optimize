@@ -30,4 +30,4 @@ useful parameters we can add would be --timeout. Thats all I can think for now.
 After having the  models and access to the actual data, it starts executing model.objects.all() bare, with select related and with prefect related to find the best strategy for "each fk".
 
 
-By default we ignore django models, if you want to include them you have to run with the --all-apps flag.
+By default we ignore django models, if you want to include them you have to run with the --django-models flag.
