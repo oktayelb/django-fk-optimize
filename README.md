@@ -1,6 +1,6 @@
 # Django Fk Optimizer
 
-this project aims at optimizing django queries for models having foregin keys.
+this project aims at optimizing django queries for models having foreign keys.
 
 Determining select_related() and prefetch_related() just by the type of the relationship is not always enough.
 
@@ -13,7 +13,7 @@ django-fk-optimizer solves this by offering the dev's a management command that 
 
 # Flow
 
-1. Aquire every model of the django project
+1. Acquire every model of the django project
 
 2. Get rid of the ones without a relation to another Model
 
@@ -27,19 +27,19 @@ django-fk-optimizer solves this by offering the dev's a management command that 
 # Commands & Args
 
 ```bash
-python manage.py fk-optimize app_name.model_name
+python manage.py fk_optimize app_name.model_name
 ```
 
-will only do the optimiziation for app_name.model_name
+will only do the optimization for app_name.model_name
 
 ```bash
-python manage.py fk-optimize app_name
+python manage.py fk_optimize app_name
 ```
 
-will do the optimiziation for every model under the app app_name
+will do the optimization for every model under the app app_name
 
 ```bash
-python manage.py fk-optimize
+python manage.py fk_optimize
 ```
 
 has the scope of the entire project.
