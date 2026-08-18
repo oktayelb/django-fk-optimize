@@ -1,5 +1,5 @@
 from django.apps import AppConfig
 
 
-class FkOptimizeConfig(AppConfig):
-    name = "FkOptimizer"
+class DjangoFkOptimizeConfig(AppConfig):
+    name = "django-fk-optimize"
