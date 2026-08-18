@@ -17,6 +17,15 @@ class Command(BaseCommand):
         )
 
     def _optimize_qs(self, model):
+
+        for field in model._meta.get_fields():
+            if field.is_relation:
+                self._optimize_realation(model, field)
+
+        #combine and try for the combined version as well.
+        pass
+
+    def _optimize_realation(self, model, field):
         pass
 
     def handle (self, *args,**options):
