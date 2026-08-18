@@ -51,3 +51,8 @@ has the scope of the entire project.
 
 
 By default we only ignore models that begin with `django.` for the moment. Third party models are not ignored as they can be discarded by the developer.
+
+
+# Future Features:
+
+Serializer based optimizations 
