@@ -43,10 +43,20 @@ the prediction is printed beside a measurement of the same relation.  Then it
 times the whole model four ways -- bare N+1, everything joined, everything
 prefetched, and the plan this command picked -- so the pick is shown beating the
 alternatives rather than merely asserted.  Those timings are calibration, not
-the verdict: they are one sample of one table on one connection, while the
-estimate is what holds at full size.  Where the two disagree the report says so
-rather than quietly switching sides.  --no-benchmark drops the timing pass and
-leaves the run reading statistics only.
+the verdict: they are one machine on one connection at one moment, while the
+estimate is what the statistics say holds in general.  Where the two disagree
+the report says so rather than quietly switching sides.  --no-benchmark drops
+the timing pass and leaves the run reading statistics only.
+
+The timings cover the whole table.  There is no LIMIT, because a slice is not
+the thing being decided about: prefetch's win comes from duplication, a slice of
+a wide table has almost none of it left, and measuring the slice would rig every
+comparison in favour of the join.  The cost of that honesty is that the N+1
+variant issues one query per row and the whole table is materialised in memory,
+which on a large table is by far the most expensive thing this command does.
+--timeout bounds each individual pass, and a pass that blows it is reported as
+unfinished rather than guessed at; --sample N goes back to slicing if you need
+the run to be cheap.
 
 On caches: the ordering half of the problem is handled -- the variants are
 interleaved and rotated so none of them owns the cold slot, the first round is
@@ -142,6 +152,7 @@ class Timing:
 
     seconds: float | None = None
     queries: int | None = None
+    timed_out: bool = False
 
 
 @dataclass
@@ -218,7 +229,8 @@ class Command(BaseCommand):
             "--timeout",
             type=int,
             default=30,
-            help="seconds to spend benchmarking a single relation (default 30)",
+            help="seconds one timing pass may run before it is abandoned "
+            "(default 30)",
         )
         parser.add_argument(
             "--django-models",
@@ -240,9 +252,10 @@ class Command(BaseCommand):
         parser.add_argument(
             "--sample",
             type=int,
-            default=1000,
-            help="rows to slice off when timing the plans (default 1000, 0 for "
-            "the whole table)",
+            default=0,
+            help="time a slice of this many rows instead of the whole table. "
+            "Cheaper, but a slice holds less duplication than the table does, "
+            "which biases every comparison toward select_related",
         )
         parser.add_argument(
             "--breakeven-bytes",
@@ -717,12 +730,17 @@ class Command(BaseCommand):
     # benchmarking (calibration)
     # ------------------------------------------------------------------
 
-    def _time_spec(self, model, spec, touch, options, using):
+    def _time_spec(self, model, spec, touch, options, using, deadline=None):
         """Time one queryset shape *including the attribute access*.
 
         Timing list(qs) without touching the relations compares one query
         against one query plus a join, which select_related can only lose.  The
         N+1 the hints exist to remove only happens on access.
+
+        Returns None if `deadline` passes before the pass finishes: a partial
+        pass over a partial set of rows is not a timing of anything.  The
+        deadline only governs the row loop -- the fetch that precedes it is one
+        statement and cannot be interrupted from here.
         """
         manager = model._default_manager.using(using)
         queryset = manager.all()
@@ -735,12 +753,16 @@ class Command(BaseCommand):
             queryset = queryset.prefetch_related(*spec.prefetch)
 
         start = perf_counter()
-        for obj in queryset:
+        for index, obj in enumerate(queryset):
             for name in touch:
                 try:
                     getattr(obj, name)
                 except ObjectDoesNotExist:
                     pass
+            # Checked every 256 rows: often enough to bound the overrun, rare
+            # enough to stay out of the measurement.
+            if deadline is not None and not index & 0xFF and perf_counter() > deadline:
+                return None
         return perf_counter() - start
 
     def _measure(self, model, specs, touch, options, using, rounds=4):
@@ -755,34 +777,53 @@ class Command(BaseCommand):
         produce a cold number for any of them -- see the module docstring.
         """
         results = {}
-        deadline = perf_counter() + options["timeout"]
+        budget = options["timeout"]
+        exhausted = set()
 
         for round_index in range(rounds):
             for offset in range(len(specs)):
                 spec = specs[(round_index + offset) % len(specs)]
-                if perf_counter() > deadline:
-                    return results or None
+                # A shape that cannot finish a pass inside the budget will not
+                # finish the next one either, and starving the others of their
+                # rounds to keep trying it helps nobody. The budget is per pass
+                # rather than per call for the same reason: an unbounded N+1
+                # must not eat the whole allowance before the plans that matter
+                # have been measured at all.
+                if spec.label in exhausted:
+                    continue
                 timing = results.setdefault(spec.label, Timing())
+                deadline = perf_counter() + budget
 
                 if round_index == 0:
                     # The warm-up round is thrown away as a timing, which makes
                     # it the right place to count queries: wrapping a round that
                     # counts would put the counter inside the measurement.
                     timing.queries = self._count_queries(
-                        model, spec, touch, options, using)
+                        model, spec, touch, options, using, deadline)
+                    if timing.queries is None:
+                        timing.timed_out = True
+                        exhausted.add(spec.label)
                     continue
 
-                elapsed = self._time_spec(model, spec, touch, options, using)
+                elapsed = self._time_spec(model, spec, touch, options, using, deadline)
+                if elapsed is None:
+                    timing.timed_out = True
+                    exhausted.add(spec.label)
+                    continue
                 if timing.seconds is None or elapsed < timing.seconds:
                     timing.seconds = elapsed
         return results or None
 
-    def _count_queries(self, model, spec, touch, options, using):
+    def _count_queries(self, model, spec, touch, options, using, deadline=None):
         """Queries one pass of `spec` costs, on every connection it touches.
 
         Watching only `using` undercounts: the router resolves a related model
         independently of the model that points at it, so an N+1 can land its
         thousand queries on a different alias than the one query that started it.
+
+        None means the pass did not finish -- the running count is a floor, not
+        a count, and reporting it as one would understate the very plan the
+        column exists to condemn.
         """
         counted = {"n": 0}
 
@@ -793,8 +834,8 @@ class Command(BaseCommand):
         with ExitStack() as stack:
             for alias in connections:
                 stack.enter_context(connections[alias].execute_wrapper(wrapper))
-            self._time_spec(model, spec, touch, options, using)
-        return counted["n"]
+            finished = self._time_spec(model, spec, touch, options, using, deadline)
+        return None if finished is None else counted["n"]
 
     def _field_specs(self, candidate):
         """The three shapes to compare for one relation."""
@@ -803,6 +844,26 @@ class Command(BaseCommand):
             PlanSpec(SELECT_RELATED, select=(candidate.name,)),
             PlanSpec(PREFETCH_RELATED, prefetch=(candidate.name,)),
         ]
+
+    def _reuse_field_timings(self, specs, recs):
+        """The model table, taken from the field pass, or None if it cannot be.
+
+        Only holds for a single relation: with two FKs the whole-model shapes
+        hint both at once and the per-field ones hint one at a time, which are
+        different querysets doing different amounts of work.
+        """
+        if len(recs) != 1 or not recs[0].timings:
+            return None
+        timings = recs[0].timings
+        # The two namings for the same unhinted shape.
+        aliases = {"N+1": "none"}
+        plans = {}
+        for spec in specs:
+            key = aliases.get(spec.label, spec.label)
+            if key not in timings:
+                return None
+            plans[spec.label] = timings[key]
+        return plans
 
     def _model_specs(self, candidates, combined):
         """The whole-model shapes to compare, and the label of the one we picked.
@@ -932,12 +993,20 @@ class Command(BaseCommand):
         plans, chosen_label = {}, "chosen"
         if not options["no_benchmark"]:
             specs, chosen_label = self._model_specs(candidates, combined)
-            try:
-                plans = self._measure(
-                    model, specs, [c.name for c in candidates], options, using,
-                ) or {}
-            except DatabaseError:
-                plans = {}
+            reused = self._reuse_field_timings(specs, recs)
+            if reused is not None:
+                # A single FK makes the whole-model shapes identical to that
+                # field's, and a pass now walks the entire table -- measuring it
+                # twice would double the most expensive part of the command to
+                # reprint numbers already on screen.
+                plans = reused
+            else:
+                try:
+                    plans = self._measure(
+                        model, specs, [c.name for c in candidates], options, using,
+                    ) or {}
+                except DatabaseError:
+                    plans = {}
 
         return ModelReport(
             model=model,
@@ -1101,8 +1170,8 @@ class Command(BaseCommand):
     def _timing_caption(self, options):
         if options["no_benchmark"]:
             return "not measured (--no-benchmark)"
-        rows = options["sample"] or "all"
-        return (f"best of 3 warm runs over {rows} rows, relations touched on every "
+        scope = f"a {options['sample']}-row slice" if options["sample"] else "the whole table"
+        return (f"best of 3 warm runs over {scope}, relations touched on every "
                 "row; calibration, not the verdict")
 
     def _render_model(self, report, options, show_alias=False):
@@ -1172,13 +1241,21 @@ class Command(BaseCommand):
             row += ("--" if timing.queries is None else str(timing.queries)).rjust(9)
             if label == report.chosen_label:
                 row += "   " + self.style.SUCCESS("<- picked")
+            elif timing.timed_out:
+                row += "   " + self.style.NOTICE("unfinished")
             self.stdout.write(row)
+
+        if any(timing.timed_out for timing in report.plans.values()):
+            self.stdout.write("#       " + self.style.NOTICE(
+                "unfinished: one pass could not complete within --timeout, so it "
+                "is left unmeasured rather than reported from a partial run"
+            ))
 
         if (fastest is not None and fastest != report.chosen_label
                 and report.chosen_label in timed
                 and timed[fastest] < timed[report.chosen_label] * 0.9):
             self.stdout.write("#       " + self.style.NOTICE(
-                f"{fastest} beat the chosen plan on this sample by "
+                f"{fastest} beat the chosen plan when measured, by "
                 f"{self._duration(timed[report.chosen_label] - timed[fastest])}"
             ))
 
@@ -1206,8 +1283,8 @@ class Command(BaseCommand):
             # two plans measured the same and there is nothing to report.
             if measured[fastest] < measured[rec.plan] * 0.9:
                 self.stdout.write(indent + self.style.NOTICE(
-                    f"measured {fastest} faster on this sample than the "
-                    f"{rec.plan} the estimate picked"
+                    f"measured {fastest} faster here than the {rec.plan} the "
+                    "estimate picked"
                 ))
 
         if options["verbosity"] >= 2:
