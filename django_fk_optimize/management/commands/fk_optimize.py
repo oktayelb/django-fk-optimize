@@ -17,15 +17,24 @@ class Command(BaseCommand):
         )
 
     def _optimize_qs(self, model):
-
+        #per_field_optimal:list[tuple[Model, field, function]] = []
         for field in model._meta.get_fields():
             if field.is_relation:
-                self._optimize_relation(model, field)
+                pass
+            #per_field_optimal.append(self._optimize_relation(model, field))
 
         #combine and try for the combined version as well.
         pass
 
     def _optimize_relation(self, model, field):
+        #try to find a solution to hot/cold cache problem
+        # we can maybe acces the manager.objects in case there is a custom manager.
+        # measure time of list(model.objects.all())
+        # measure time of list(model.objects.all().select_related(field))
+        # measure time of list(model.objects.all().prefetch_related(field))
+        # return somehow the information of the best option
+        # maybe (model, field , faster_function_pointer)?
+        
         pass
 
     def handle (self, *args,**options):
