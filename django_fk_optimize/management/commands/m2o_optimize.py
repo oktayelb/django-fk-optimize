@@ -39,11 +39,23 @@ a default and reported as an assumption rather than a measurement.
 --allow-scan falls back to COUNT queries on any backend.
 
 Every run also times both plans, and the unhinted N+1 they exist to replace, so
-the prediction is printed beside a measurement of the same relation.  Those
-timings are calibration, not the verdict: they are one sample of one table on
-one connection, while the estimate is what holds at full size.  Where the two
-disagree the report says so rather than quietly switching sides.
---no-benchmark drops the timing pass and leaves the run reading statistics only.
+the prediction is printed beside a measurement of the same relation.  Then it
+times the whole model four ways -- bare N+1, everything joined, everything
+prefetched, and the plan this command picked -- so the pick is shown beating the
+alternatives rather than merely asserted.  Those timings are calibration, not
+the verdict: they are one sample of one table on one connection, while the
+estimate is what holds at full size.  Where the two disagree the report says so
+rather than quietly switching sides.  --no-benchmark drops the timing pass and
+leaves the run reading statistics only.
+
+On caches: the ordering half of the problem is handled -- the variants are
+interleaved and rotated so none of them owns the cold slot, the first round is
+discarded, and each variant keeps its fastest run.  The regime half is not, and
+cannot be from inside a database connection: after the discarded round every
+page is in cache, so every number here is a warm one.  That is the right regime
+for a query that runs all day and the wrong one for first-hit latency, and no
+amount of rearranging inside the session will produce a cold measurement --
+that needs the server's buffer pool and the OS page cache dropped from outside.
 
 The output is a lookup table: "if a call site iterates this model and touches
 this FK, use X".  It is not advice to bake X into a default manager -- whether a
@@ -52,6 +64,7 @@ see.
 """
 
 import json
+from contextlib import ExitStack
 from dataclasses import dataclass, field as dataclass_field
 from time import perf_counter
 
@@ -124,12 +137,33 @@ class Estimate:
 
 
 @dataclass
+class Timing:
+    """One measured queryset shape."""
+
+    seconds: float | None = None
+    queries: int | None = None
+
+
+@dataclass
+class PlanSpec:
+    """A queryset shape to time: what to hint, under what name."""
+
+    label: str
+    select: tuple[str, ...] = ()
+    prefetch: tuple[str, ...] = ()
+
+    @property
+    def shape(self):
+        return self.select, self.prefetch
+
+
+@dataclass
 class Recommendation:
     candidate: Candidate
     plan: str
     reason: str
     estimate: Estimate | None = None
-    timings: dict | None = None
+    timings: dict[str, Timing] | None = None
 
 
 @dataclass
@@ -166,6 +200,11 @@ class ModelReport:
     using: str
     recs: list[Recommendation] = dataclass_field(default_factory=list)
     combined: Combined = dataclass_field(default_factory=Combined)
+
+    # The whole-model comparison: every plan timed end to end, and which of
+    # those labels is the one this command picked.
+    plans: dict[str, Timing] = dataclass_field(default_factory=dict)
+    chosen_label: str = "chosen"
 
 
 class Command(BaseCommand):
@@ -678,54 +717,112 @@ class Command(BaseCommand):
     # benchmarking (calibration)
     # ------------------------------------------------------------------
 
-    def _time_plan(self, candidate, plan, options, using):
-        """Time one plan *including the attribute access*.
+    def _time_spec(self, model, spec, touch, options, using):
+        """Time one queryset shape *including the attribute access*.
 
-        Timing list(qs) without touching the relation compares one query against
-        one query plus a join, which select_related can only lose.  The N+1 the
-        join exists to remove only happens on access.
+        Timing list(qs) without touching the relations compares one query
+        against one query plus a join, which select_related can only lose.  The
+        N+1 the hints exist to remove only happens on access.
         """
-        manager = candidate.model._default_manager.using(using)
+        manager = model._default_manager.using(using)
         queryset = manager.all()
         sample = options["sample"]
         if sample:
             queryset = queryset[:sample]
-        if plan == SELECT_RELATED:
-            queryset = queryset.select_related(candidate.name)
-        elif plan == PREFETCH_RELATED:
-            queryset = queryset.prefetch_related(candidate.name)
+        if spec.select:
+            queryset = queryset.select_related(*spec.select)
+        if spec.prefetch:
+            queryset = queryset.prefetch_related(*spec.prefetch)
 
         start = perf_counter()
         for obj in queryset:
-            try:
-                getattr(obj, candidate.name)
-            except ObjectDoesNotExist:
-                pass
+            for name in touch:
+                try:
+                    getattr(obj, name)
+                except ObjectDoesNotExist:
+                    pass
         return perf_counter() - start
 
-    def _benchmark(self, candidate, options, using, rounds=4):
-        """Interleaved, min-of-k timings for the three plans.
+    def _measure(self, model, specs, touch, options, using, rounds=4):
+        """Interleaved, min-of-k timings for a set of queryset shapes.
 
-        Interleaved because running the plans in blocks measures the buffer
-        cache warming up and crowns whichever variant went last.  Min rather
-        than mean because the noise here is one-sided.
+        Interleaved and rotated because running the shapes in blocks measures
+        the buffer cache warming up and crowns whichever went last.  Min rather
+        than mean because the noise here is one-sided: a run can be delayed by
+        something else on the machine, never speeded up by it.
+
+        This handles which shape gets the cold cache.  It does not, and cannot,
+        produce a cold number for any of them -- see the module docstring.
         """
-        plans = [None, SELECT_RELATED, PREFETCH_RELATED]
-        best = {}
+        results = {}
         deadline = perf_counter() + options["timeout"]
 
         for round_index in range(rounds):
-            # Rotate the order so no plan permanently owns the cold-cache slot.
-            for offset in range(len(plans)):
-                plan = plans[(round_index + offset) % len(plans)]
+            for offset in range(len(specs)):
+                spec = specs[(round_index + offset) % len(specs)]
                 if perf_counter() > deadline:
-                    return best or None
-                elapsed = self._time_plan(candidate, plan, options, using)
+                    return results or None
+                timing = results.setdefault(spec.label, Timing())
+
                 if round_index == 0:
-                    continue  # warm-up round, discarded
-                key = plan or "none"
-                best[key] = min(best.get(key, elapsed), elapsed)
-        return best or None
+                    # The warm-up round is thrown away as a timing, which makes
+                    # it the right place to count queries: wrapping a round that
+                    # counts would put the counter inside the measurement.
+                    timing.queries = self._count_queries(
+                        model, spec, touch, options, using)
+                    continue
+
+                elapsed = self._time_spec(model, spec, touch, options, using)
+                if timing.seconds is None or elapsed < timing.seconds:
+                    timing.seconds = elapsed
+        return results or None
+
+    def _count_queries(self, model, spec, touch, options, using):
+        """Queries one pass of `spec` costs, on every connection it touches.
+
+        Watching only `using` undercounts: the router resolves a related model
+        independently of the model that points at it, so an N+1 can land its
+        thousand queries on a different alias than the one query that started it.
+        """
+        counted = {"n": 0}
+
+        def wrapper(execute, sql, params, many, context):
+            counted["n"] += 1
+            return execute(sql, params, many, context)
+
+        with ExitStack() as stack:
+            for alias in connections:
+                stack.enter_context(connections[alias].execute_wrapper(wrapper))
+            self._time_spec(model, spec, touch, options, using)
+        return counted["n"]
+
+    def _field_specs(self, candidate):
+        """The three shapes to compare for one relation."""
+        return [
+            PlanSpec("none"),
+            PlanSpec(SELECT_RELATED, select=(candidate.name,)),
+            PlanSpec(PREFETCH_RELATED, prefetch=(candidate.name,)),
+        ]
+
+    def _model_specs(self, candidates, combined):
+        """The whole-model shapes to compare, and the label of the one we picked.
+
+        The chosen plan often *is* one of the other three -- with a single FK it
+        always is -- so it only gets its own row when it actually differs.
+        Timing the same queryset twice measures noise, not a fourth option.
+        """
+        names = tuple(candidate.name for candidate in candidates)
+        specs = [
+            PlanSpec("N+1"),
+            PlanSpec(SELECT_RELATED, select=names),
+            PlanSpec(PREFETCH_RELATED, prefetch=names),
+        ]
+        chosen = (tuple(combined.select), tuple(combined.prefetch))
+        for spec in specs:
+            if spec.shape == chosen:
+                return specs, spec.label
+        specs.append(PlanSpec("chosen", select=chosen[0], prefetch=chosen[1]))
+        return specs, "chosen"
 
     # ------------------------------------------------------------------
     # per-relation and per-model decisions
@@ -738,7 +835,10 @@ class Command(BaseCommand):
         timings = None
         if not options["no_benchmark"]:
             try:
-                timings = self._benchmark(candidate, options, using)
+                timings = self._measure(
+                    candidate.model, self._field_specs(candidate),
+                    (candidate.name,), options, using,
+                )
             except DatabaseError:
                 # One unreadable table should cost its own timings, not the
                 # whole report.
@@ -747,8 +847,9 @@ class Command(BaseCommand):
         if estimate.saved_bytes is None:
             if timings:
                 plan = min(
-                    (p for p in (SELECT_RELATED, PREFETCH_RELATED) if p in timings),
-                    key=lambda p: timings[p],
+                    (p for p in (SELECT_RELATED, PREFETCH_RELATED)
+                     if p in timings and timings[p].seconds is not None),
+                    key=lambda p: timings[p].seconds,
                     default=SELECT_RELATED,
                 )
                 reason = "measured (no statistics available)"
@@ -818,16 +919,34 @@ class Command(BaseCommand):
 
     def _optimize_qs(self, model, options):
         using = router.db_for_read(model) or "default"
+        candidates = self._candidates(model)
         recs = [
             self._optimize_relation(candidate, options, using)
-            for candidate in self._candidates(model)
+            for candidate in candidates
         ]
+        combined = self._combine(model, recs)
+
+        # Time the model as a whole under every plan, the chosen one included,
+        # so the recommendation is shown beating the alternatives instead of
+        # only being argued for.
+        plans, chosen_label = {}, "chosen"
+        if not options["no_benchmark"]:
+            specs, chosen_label = self._model_specs(candidates, combined)
+            try:
+                plans = self._measure(
+                    model, specs, [c.name for c in candidates], options, using,
+                ) or {}
+            except DatabaseError:
+                plans = {}
+
         return ModelReport(
             model=model,
             label=model._meta.label,
             using=using,
             recs=recs,
-            combined=self._combine(model, recs),
+            combined=combined,
+            plans=plans,
+            chosen_label=chosen_label,
         )
 
     # ------------------------------------------------------------------
@@ -846,8 +965,12 @@ class Command(BaseCommand):
                 return f"{value:.1f}{unit}"
             value /= 1024
 
-    def _ms(self, seconds):
-        return "--" if seconds is None else f"{seconds * 1000:.1f}ms"
+    def _duration(self, seconds):
+        if seconds is None:
+            return "--"
+        if seconds >= 1.0:
+            return f"{seconds:.2f}s"
+        return f"{seconds * 1000:.1f}ms"
 
     def _database_info(self, alias):
         """What the verdicts were computed against.
@@ -929,10 +1052,13 @@ class Command(BaseCommand):
                 "assumptions": rec.estimate.notes,
             }
         if rec.timings is not None:
-            payload["timings"] = rec.timings
+            payload["timings"] = {
+                label: {"seconds": timing.seconds, "queries": timing.queries}
+                for label, timing in rec.timings.items()
+            }
         return payload
 
-    def _render(self, reports, options):
+    def _render(self, reports, options, elapsed=None):
         """One runnable queryset per model, over what each plan actually cost.
 
         Everything that is not a queryset is commented, so the whole report
@@ -961,12 +1087,23 @@ class Command(BaseCommand):
                 "into a manager."
             ))
 
+        if verbosity >= 1 and elapsed is not None:
+            relations = sum(len(report.recs) for report in reports)
+            self.stdout.write(
+                "# " + self.style.MIGRATE_LABEL("total: ")
+                + self.style.MIGRATE_HEADING(
+                    f"{self._duration(elapsed)} for {len(reports)} model"
+                    f"{'' if len(reports) == 1 else 's'}, "
+                    f"{relations} relation{'' if relations == 1 else 's'}"
+                )
+            )
+
     def _timing_caption(self, options):
         if options["no_benchmark"]:
             return "not measured (--no-benchmark)"
         rows = options["sample"] or "all"
-        return (f"best of 3 runs over {rows} rows, relation touched on every row; "
-                "calibration, not the verdict")
+        return (f"best of 3 warm runs over {rows} rows, relations touched on every "
+                "row; calibration, not the verdict")
 
     def _render_model(self, report, options, show_alias=False):
         verbosity = options["verbosity"]
@@ -987,6 +1124,8 @@ class Command(BaseCommand):
 
             for rec in recs:
                 self._render_row(rec, options, name_width)
+
+            self._render_model_plans(report)
 
         if report.combined.call:
             self.stdout.write(self._styled_call(report))
@@ -1012,18 +1151,51 @@ class Command(BaseCommand):
         if verbosity >= 1:
             self.stdout.write("#")
 
+    def _render_model_plans(self, report):
+        """The whole model, timed under every plan including the chosen one."""
+        if not report.plans:
+            return
+
+        label_width = max([len("whole model")] + [len(l) for l in report.plans])
+        header = ("#   " + "whole model".ljust(label_width)
+                  + "total".rjust(self.TIMING_WIDTH) + "queries".rjust(9))
+        self.stdout.write(self.style.MIGRATE_LABEL(header))
+
+        timed = {label: timing.seconds for label, timing in report.plans.items()
+                 if timing.seconds is not None}
+        fastest = min(timed, key=timed.get) if timed else None
+
+        for label, timing in report.plans.items():
+            row = "#   " + label.ljust(label_width)
+            cell = self._duration(timing.seconds).rjust(self.TIMING_WIDTH)
+            row += self.style.SUCCESS(cell) if label == fastest else cell
+            row += ("--" if timing.queries is None else str(timing.queries)).rjust(9)
+            if label == report.chosen_label:
+                row += "   " + self.style.SUCCESS("<- picked")
+            self.stdout.write(row)
+
+        if (fastest is not None and fastest != report.chosen_label
+                and report.chosen_label in timed
+                and timed[fastest] < timed[report.chosen_label] * 0.9):
+            self.stdout.write("#       " + self.style.NOTICE(
+                f"{fastest} beat the chosen plan on this sample by "
+                f"{self._duration(timed[report.chosen_label] - timed[fastest])}"
+            ))
+
     def _render_row(self, rec, options, name_width):
         timings = rec.timings or {}
         # Fastest of the two real plans, for highlighting only. The verdict
         # comes from the estimate; see _timing_caption for why.
-        measured = {plan: timings[plan]
-                    for plan in (SELECT_RELATED, PREFETCH_RELATED) if plan in timings}
+        measured = {plan: timings[plan].seconds
+                    for plan in (SELECT_RELATED, PREFETCH_RELATED)
+                    if plan in timings and timings[plan].seconds is not None}
         fastest = min(measured, key=measured.get) if measured else None
 
         row = "#   " + rec.candidate.name.ljust(name_width)
         for _, key in self.TIMED_PLANS:
+            seconds = timings[key].seconds if key in timings else None
             # Pad before styling: the escape codes are not printable width.
-            cell = self._ms(timings.get(key)).rjust(self.TIMING_WIDTH)
+            cell = self._duration(seconds).rjust(self.TIMING_WIDTH)
             row += self._styled_plan(key, cell) if key == fastest else cell
         row += "   " + self._styled_plan(rec.plan)
         self.stdout.write(row)
@@ -1047,6 +1219,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
 
+        started = perf_counter()
         selection: str | None = options["app.model"]
         model_s: list[type[Model]] = []
 
@@ -1086,7 +1259,7 @@ class Command(BaseCommand):
                 reports.append(report)
 
         if options["json"]:
-            self.stdout.write(json.dumps({
+            payload = {
                 report.label: {
                     "database": self._database_info(report.using),
                     "fields": [self._as_dict(r) for r in report.recs],
@@ -1098,8 +1271,15 @@ class Command(BaseCommand):
                         "saved_bytes": report.combined.saved_bytes,
                         "call": report.combined.call,
                     },
+                    "plans": {
+                        label: {"seconds": timing.seconds, "queries": timing.queries,
+                                "chosen": label == report.chosen_label}
+                        for label, timing in report.plans.items()
+                    },
                 }
                 for report in reports
-            }, indent=2))
+            }
+            payload["_total_seconds"] = perf_counter() - started
+            self.stdout.write(json.dumps(payload, indent=2))
         else:
-            self._render(reports, options)
+            self._render(reports, options, elapsed=perf_counter() - started)
