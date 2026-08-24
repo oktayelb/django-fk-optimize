@@ -2,6 +2,8 @@ from django.core.management.base import BaseCommand , CommandError
 from django.db.models import Model
 from django.apps.registry import apps
 
+import time
+
 class Command(BaseCommand):
 
     help = "Queryset optimizer tool for models containing foreign keys."
@@ -17,25 +19,66 @@ class Command(BaseCommand):
         )
 
     def _optimize_qs(self, model):
-        #per_field_optimal:list[tuple[Model, field, function]] = []
+        prefetch_fields = []
+        select_fields = []
         for field in model._meta.get_fields():
-            if field.is_relation:
-                pass
-            #per_field_optimal.append(self._optimize_relation(model, field))
+            if not field.is_relation:
+                continue
+            if self._optimize_relation(model, field)[0] == "prefetch":
+                prefetch_fields.append(field)
+            else:
+                select_fields.append(field)
+
+        #try bare
+        #try all select related
+        # try all prefetch related
+        # try the per field optimal that we have derived.
+
+        # report the best
 
         #combine and try for the combined version as well.
-        pass
+        
 
     def _optimize_relation(self, model, field):
-        #try to find a solution to hot/cold cache problem
-        # we can maybe acces the manager.objects in case there is a custom manager.
-        # measure time of list(model.objects.all())
-        # measure time of list(model.objects.all().select_related(field))
-        # measure time of list(model.objects.all().prefetch_related(field))
-        # return somehow the information of the best option
-        # maybe (model, field , faster_function_pointer)?
+
         
-        pass
+        ## warm cache for fair results. maybe move this to _optimize_qs()
+        cache_warmer: int = 10
+        winner : str = ""
+        for i in range (0,cache_warmer):
+            list(model.objects.all())
+
+        start_time: float = time.perf_counter()
+        list(model.objects.all())
+        end_time: float = time.perf_counter()
+
+        vanilla_time: float = end_time - start_time
+
+        start_time= time.perf_counter()
+        list(model.objects.all().select_related(field))
+        end_time = time.perf_counter()
+
+        select_related_time: float = end_time - start_time
+
+        start_time = time.perf_counter()
+        list(model.objects.all().prefetch_related(field))
+        end_time = time.perf_counter()
+
+        prefetch_related_time: float = end_time - start_time
+
+        if prefetch_related_time > select_related_time:
+            if prefetch_related_time > vanilla_time:
+                winner = "prefetch"
+            else:
+                winner = "vanilla"
+        else:
+            if select_related_time  > vanilla_time:
+                winner = "select"
+            else:
+                winner = "vanilla"
+
+        return [winner, vanilla_time, select_related_time, prefetch_related_time]
+        
 
     def handle (self, *args,**options):
 
@@ -61,10 +104,7 @@ class Command(BaseCommand):
         except (LookupError ,ValueError) as e:
             raise CommandError(str(e)) from e
 
-        #only keep the models that has at least one fk
-        #.is_relatiın is weak,too general for the purpose of this project.
-        # the only place where a  split between  select and prefetch ever can occur is
-        # if there is a many to one relation.
+        
         model_s = [mdl for mdl in model_s if any(f.is_relation for f in mdl._meta.get_fields())]
 
         if not model_s:
