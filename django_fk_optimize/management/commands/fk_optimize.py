@@ -62,6 +62,9 @@ class Command(BaseCommand):
             raise CommandError(str(e)) from e
 
         #only keep the models that has at least one fk
+        #.is_relatiın is weak,too general for the purpose of this project.
+        # the only place where a  split between  select and prefetch ever can occur is
+        # if there is a many to one relation.
         model_s = [mdl for mdl in model_s if any(f.is_relation for f in mdl._meta.get_fields())]
 
         if not model_s:
