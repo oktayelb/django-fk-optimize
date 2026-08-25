@@ -82,12 +82,12 @@ class Command(BaseCommand):
             fields += prefetch_fields
 
         start_time: float = time.perf_counter()
+        
         # not so sur eabout this part
         # we might need to time the query and the N+1 part seperately
         for element in qs:
             for field in fields:
-                pass
-            #access element.field to trigger N+1
+                getattr(element,field.name) if field else None
         end_time: float = time.perf_counter()
         return end_time - start_time
 
