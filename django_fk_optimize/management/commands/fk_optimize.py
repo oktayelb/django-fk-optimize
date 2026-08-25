@@ -49,28 +49,35 @@ class Command(BaseCommand):
             list(model.objects.all())
 
 
+    def _time_qs(self, model:type[Model], field: Optional[Field] = None , db_function = None ) -> float:
+        qs = model.objects.all()
+
+        if db_function == "select":
+            qs = qs.select_related(field.name)
+        elif db_function == "prefetch":
+            qs = qs.prefetch_related(field.name)
+
+        start_time: float = time.perf_counter()
+        # not so sur eabout this part
+        # we might need to time the query and the N+1 part seperately
+        for element in qs:
+            pass
+            #access element.field to trigger N+1
+        end_time: float = time.perf_counter()
+        return end_time - start_time
+
     def _optimize_relation(self, model: type[Model], field:Field ) -> tuple[Literal["prefetch", "select", "vanilla"], float, float, float]:
 
         self._warmup_cache(model=model)
         winner: Literal["prefetch", "select", "vanilla"] = "vanilla"
 
-        start_time: float = time.perf_counter()
-        list(model.objects.all())
-        end_time: float = time.perf_counter()
 
-        vanilla_time: float = end_time - start_time
+        vanilla_time: float =  self._time_qs(model,field)
 
-        start_time= time.perf_counter()
-        list(model.objects.all().select_related(field.name))
-        end_time = time.perf_counter()
+        select_related_time: float = self._time_qs(model,field,"select")
 
-        select_related_time: float = end_time - start_time
 
-        start_time = time.perf_counter()
-        list(model.objects.all().prefetch_related(field.name))
-        end_time = time.perf_counter()
-
-        prefetch_related_time: float = end_time - start_time
+        prefetch_related_time: float = self._time_qs(model,field,"prefetch")
 
         if prefetch_related_time < select_related_time:
             if prefetch_related_time < vanilla_time:
