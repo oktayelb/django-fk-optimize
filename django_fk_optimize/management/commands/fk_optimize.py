@@ -1,4 +1,5 @@
 from os import times
+from xml.parsers.expat import model
 
 from django.core.management.base import BaseCommand , CommandError
 from django.db.models import Model, Field, ForeignObjectRel
@@ -57,9 +58,10 @@ class Command(BaseCommand):
 
         return per_field_time_metrics, final_times
         
-    def _warmup_cache(self, model: type[Model], field : Optional[Field] = None, count:int = 10) -> None:
+    def _warmup_cache(self, model: type[Model], field : Optional[Field] = None, count:int = 3) -> None:
         for i in range (0,count):
-            list(model.objects.all())
+            for i in model.objects.all():
+                getattr(i,field.name) if field else None
 
     # generalize this to accept list of fields so we can actually time  objects.all().prefetch(f1,f2).select(f3,f4)
     def _time_qs(self, model:type[Model],
@@ -95,7 +97,7 @@ class Command(BaseCommand):
 
     def _optimize_relation(self, model: type[Model], field:Field ) -> tuple[FieldOperation, float, float, float]:
 
-        self._warmup_cache(model=model)
+        self._warmup_cache(model=model,field=field)
         winner: FieldOperation = FieldOperation.VANILLA
 
 
