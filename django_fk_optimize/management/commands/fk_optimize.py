@@ -55,20 +55,34 @@ class Command(BaseCommand):
         for i in range (0,count):
             list(model.objects.all())
 
-
-    def _time_qs(self, model:type[Model], field: Field, db_function = FieldOperation.VANILLA) -> float:
+    # generalize this to accept list of fields so we can actually time  objects.all().prefetch(f1,f2).select(f3,f4)
+    def _time_qs(self, model:type[Model],
+                *, 
+                prefetch_fields: Optional[list[Field]] = None,
+                select_fields: Optional[list[Field]]= None,
+                vanilla_fields: Optional[list[Field]]= None
+                ) -> float:
+        
         qs = model.objects.all()
+        fields: list[Field] = []
+        if vanilla_fields:
+            fields += vanilla_fields
 
-        if db_function == FieldOperation.SELECT_RELATED:
-            qs = qs.select_related(field.name)
-        elif db_function == FieldOperation.PREFETCH_RELATED:
-            qs = qs.prefetch_related(field.name)
+        
+        if select_fields:
+            qs = qs.select_related(*(field.name for field in select_fields))
+            fields += select_fields
+
+        if prefetch_fields:
+            qs = qs.prefetch_related(*(field.name for field in prefetch_fields))
+            fields += prefetch_fields
 
         start_time: float = time.perf_counter()
         # not so sur eabout this part
         # we might need to time the query and the N+1 part seperately
         for element in qs:
-            pass
+            for field in fields:
+                pass
             #access element.field to trigger N+1
         end_time: float = time.perf_counter()
         return end_time - start_time
@@ -79,12 +93,12 @@ class Command(BaseCommand):
         winner: FieldOperation = FieldOperation.VANILLA
 
 
-        vanilla_time: float =  self._time_qs(model,field)
+        vanilla_time: float =  self._time_qs(model,vanilla_fields=[field])
 
-        select_related_time: float = self._time_qs(model,field,FieldOperation.SELECT_RELATED)
+        select_related_time: float = self._time_qs(model,select_fields=[field])
 
 
-        prefetch_related_time: float = self._time_qs(model,field,FieldOperation.PREFETCH_RELATED)
+        prefetch_related_time: float = self._time_qs(model,prefetch_fields=[field])
 
         if prefetch_related_time < select_related_time:
             if prefetch_related_time < vanilla_time:
