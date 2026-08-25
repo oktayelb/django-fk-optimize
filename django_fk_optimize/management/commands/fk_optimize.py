@@ -51,10 +51,7 @@ class Command(BaseCommand):
         suggested_optimization_time = self._time_qs(model,select_fields= select_fields,prefetch_fields=prefetch_fields)
         final_times["no_optimization_time"] = no_optimization_time
         final_times["suggested_optimization_time"] = suggested_optimization_time
-        # we should maybe
-        # try all selectables by themselves
-        # try all prefetchables by themselves
-        # or try every possibility??
+
 
         return per_field_time_metrics, final_times
         
@@ -63,7 +60,6 @@ class Command(BaseCommand):
             for i in model.objects.all():
                 getattr(i,field.name) if field else None
 
-    # generalize this to accept list of fields so we can actually time  objects.all().prefetch(f1,f2).select(f3,f4)
     def _time_qs(self, model:type[Model],
                 *, 
                 prefetch_fields: Optional[list[Field]] = None,

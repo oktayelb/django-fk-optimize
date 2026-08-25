@@ -56,3 +56,9 @@ By default we only ignore models that begin with `django.` for the moment. Third
 # Future Features:
 
 Serializer based optimizations 
+
+for the final metrics,
+we should maybe
+try all selectables by themselves
+try all prefetchables by themselves
+or try every possibility??
