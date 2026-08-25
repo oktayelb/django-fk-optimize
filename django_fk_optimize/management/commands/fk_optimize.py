@@ -1,8 +1,9 @@
 from django.core.management.base import BaseCommand , CommandError
-from django.db.models import Model
+from django.db.models import Model, ForeignObject , Field
 from django.apps.registry import apps
 
 import time
+from typing import Optional
 
 class Command(BaseCommand):
 
@@ -18,7 +19,7 @@ class Command(BaseCommand):
             help= "when set includes django (and third party) models"
         )
 
-    def _optimize_qs(self, model):
+    def _optimize_qs(self, model: Model):
         prefetch_fields = []
         select_fields = []
         for field in model._meta.get_fields():
@@ -29,7 +30,8 @@ class Command(BaseCommand):
             else:
                 select_fields.append(field)
 
-        #try bare
+
+
         #try all select related
         # try all prefetch related
         # try the per field optimal that we have derived.
@@ -38,15 +40,15 @@ class Command(BaseCommand):
 
         #combine and try for the combined version as well.
         
-
-    def _optimize_relation(self, model, field):
-
-        
-        ## warm cache for fair results. maybe move this to _optimize_qs()
-        cache_warmer: int = 10
-        winner : str = ""
-        for i in range (0,cache_warmer):
+    def _warmup_cache(self, model, field : Optional[Field], count: Optional[int] = 10):
+        for i in range (0,count):
             list(model.objects.all())
+
+
+    def _optimize_relation(self, model: Model, field:Field):
+
+        self._warmup_cache(model=model)
+        winner : str = ""
 
         start_time: float = time.perf_counter()
         list(model.objects.all())
