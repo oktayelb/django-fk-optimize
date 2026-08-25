@@ -22,12 +22,16 @@ class Command(BaseCommand):
     def _optimize_qs(self, model: type[Model]):
         prefetch_fields: list[Field] = []
         select_fields : list[Field]  = []
+        time_metrics: list[tuple[float,float,float]] = []
         for field in model._meta.get_fields():
             if not field.is_relation:
                 continue
-            if self._optimize_relation(model, field)[0] == "prefetch":
+            field_results = self._optimize_relation(model,field)
+            time_metrics.append(field_results[1:])
+            result = field_results[0]
+            if result == "prefetch":
                 prefetch_fields.append(field)
-            else:
+            elif result == "select":
                 select_fields.append(field)
 
 
