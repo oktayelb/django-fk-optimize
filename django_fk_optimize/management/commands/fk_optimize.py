@@ -3,7 +3,7 @@ from django.db.models import Model, ForeignObject , Field
 from django.apps.registry import apps
 
 import time
-from typing import Optional
+from typing import Optional ,Literal
 
 class Command(BaseCommand):
 
@@ -19,9 +19,9 @@ class Command(BaseCommand):
             help= "when set includes django (and third party) models"
         )
 
-    def _optimize_qs(self, model: Model):
-        prefetch_fields = []
-        select_fields = []
+    def _optimize_qs(self, model: type[Model]):
+        prefetch_fields: list[Field] = []
+        select_fields : list[Field]  = []
         for field in model._meta.get_fields():
             if not field.is_relation:
                 continue
@@ -40,15 +40,15 @@ class Command(BaseCommand):
 
         #combine and try for the combined version as well.
         
-    def _warmup_cache(self, model, field : Optional[Field], count: Optional[int] = 10):
+    def _warmup_cache(self, model: type[Model], field : Optional[Field] = None, count:int = 10) -> None:
         for i in range (0,count):
             list(model.objects.all())
 
 
-    def _optimize_relation(self, model: Model, field:Field):
+    def _optimize_relation(self, model: type[Model], field:Field ) -> tuple[Literal["prefetch", "select", "vanilla"], float, float, float]:
 
         self._warmup_cache(model=model)
-        winner : str = ""
+        winner: Literal["prefetch", "select", "vanilla"] = "vanilla"
 
         start_time: float = time.perf_counter()
         list(model.objects.all())
@@ -79,7 +79,7 @@ class Command(BaseCommand):
             else:
                 winner = "vanilla"
 
-        return [winner, vanilla_time, select_related_time, prefetch_related_time]
+        return (winner, vanilla_time, select_related_time, prefetch_related_time)
         
 
     def handle (self, *args,**options):
