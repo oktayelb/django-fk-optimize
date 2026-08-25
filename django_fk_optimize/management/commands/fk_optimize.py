@@ -61,13 +61,13 @@ class Command(BaseCommand):
         vanilla_time: float = end_time - start_time
 
         start_time= time.perf_counter()
-        list(model.objects.all().select_related(field))
+        list(model.objects.all().select_related(field.name))
         end_time = time.perf_counter()
 
         select_related_time: float = end_time - start_time
 
         start_time = time.perf_counter()
-        list(model.objects.all().prefetch_related(field))
+        list(model.objects.all().prefetch_related(field.name))
         end_time = time.perf_counter()
 
         prefetch_related_time: float = end_time - start_time
