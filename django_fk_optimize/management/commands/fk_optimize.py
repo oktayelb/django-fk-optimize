@@ -68,13 +68,13 @@ class Command(BaseCommand):
 
         prefetch_related_time: float = end_time - start_time
 
-        if prefetch_related_time > select_related_time:
-            if prefetch_related_time > vanilla_time:
+        if prefetch_related_time < select_related_time:
+            if prefetch_related_time < vanilla_time:
                 winner = "prefetch"
             else:
                 winner = "vanilla"
         else:
-            if select_related_time  > vanilla_time:
+            if select_related_time  < vanilla_time:
                 winner = "select"
             else:
                 winner = "vanilla"
