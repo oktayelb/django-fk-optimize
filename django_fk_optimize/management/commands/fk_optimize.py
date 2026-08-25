@@ -1,5 +1,7 @@
+from os import times
+
 from django.core.management.base import BaseCommand , CommandError
-from django.db.models import Model, ForeignObject , Field
+from django.db.models import Model, Field, ForeignObjectRel
 from django.apps.registry import apps
 
 import time
@@ -26,30 +28,34 @@ class Command(BaseCommand):
             help= "when set includes django (and third party) models"
         )
 
-    def _optimize_qs(self, model: type[Model]):
+    def _optimize_qs(self, model: type[Model]) ->tuple[list[tuple[FieldOperation,float,float,float]] ,dict[str,float]]:
         prefetch_fields: list[Field] = []
         select_fields : list[Field]  = []
-        time_metrics: list[tuple[float,float,float]] = []
-        for field in model._meta.get_fields():
+        per_field_time_metrics: list[tuple[FieldOperation,float,float,float]] = []
+
+        model_fields: list[Field[any,any] | ForeignObjectRel] = model._meta.get_fields()
+        for field in model_fields:
             if not field.is_relation:
                 continue
             field_results = self._optimize_relation(model,field)
-            time_metrics.append(field_results[1:])
+            per_field_time_metrics.append(field_results)
             result = field_results[0]
             if result == FieldOperation.PREFETCH_RELATED:
                 prefetch_fields.append(field)
             elif result == FieldOperation.SELECT_RELATED:
                 select_fields.append(field)
 
+        final_times: dict[str,float] = {}
+        no_optimization_time = self._time_qs(model,vanilla_fields= model_fields)
+        suggested_optimization_time = self._time_qs(model,select_fields= select_fields,prefetch_fields=prefetch_fields)
+        final_times["no_optimization_time"] = no_optimization_time
+        final_times["suggested_optimization_time"] = suggested_optimization_time
+        # we should maybe
+        # try all selectables by themselves
+        # try all prefetchables by themselves
+        # or try every possibility??
 
-
-        #try all select related
-        # try all prefetch related
-        # try the per field optimal that we have derived.
-
-        # report the best
-
-        #combine and try for the combined version as well.
+        return per_field_time_metrics, final_times
         
     def _warmup_cache(self, model: type[Model], field : Optional[Field] = None, count:int = 10) -> None:
         for i in range (0,count):
@@ -147,7 +153,4 @@ class Command(BaseCommand):
 
         else:
             for mdl in model_s:
-                self._optimize_qs(mdl)
-
-       # return the results
-        
+                per_field_time_metrics, final_times = self._optimize_qs(mdl)
