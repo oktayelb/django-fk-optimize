@@ -3,7 +3,14 @@ from django.db.models import Model, ForeignObject , Field
 from django.apps.registry import apps
 
 import time
-from typing import Optional ,Literal
+from typing import Optional 
+from enum import Enum
+
+
+class FieldOperation(str, Enum):
+    VANILLA = "vanilla"
+    SELECT_RELATED = "select_related"
+    PREFETCH_RELATED = "prefetch_related"
 
 class Command(BaseCommand):
 
@@ -29,9 +36,9 @@ class Command(BaseCommand):
             field_results = self._optimize_relation(model,field)
             time_metrics.append(field_results[1:])
             result = field_results[0]
-            if result == "prefetch":
+            if result == FieldOperation.PREFETCH_RELATED:
                 prefetch_fields.append(field)
-            elif result == "select":
+            elif result == FieldOperation.SELECT_RELATED:
                 select_fields.append(field)
 
 
@@ -49,12 +56,12 @@ class Command(BaseCommand):
             list(model.objects.all())
 
 
-    def _time_qs(self, model:type[Model], field: Optional[Field] = None , db_function = None ) -> float:
+    def _time_qs(self, model:type[Model], field: Field, db_function = FieldOperation.VANILLA) -> float:
         qs = model.objects.all()
 
-        if db_function == "select":
+        if db_function == FieldOperation.SELECT_RELATED:
             qs = qs.select_related(field.name)
-        elif db_function == "prefetch":
+        elif db_function == FieldOperation.PREFETCH_RELATED:
             qs = qs.prefetch_related(field.name)
 
         start_time: float = time.perf_counter()
@@ -66,29 +73,29 @@ class Command(BaseCommand):
         end_time: float = time.perf_counter()
         return end_time - start_time
 
-    def _optimize_relation(self, model: type[Model], field:Field ) -> tuple[Literal["prefetch", "select", "vanilla"], float, float, float]:
+    def _optimize_relation(self, model: type[Model], field:Field ) -> tuple[FieldOperation, float, float, float]:
 
         self._warmup_cache(model=model)
-        winner: Literal["prefetch", "select", "vanilla"] = "vanilla"
+        winner: FieldOperation = FieldOperation.VANILLA
 
 
         vanilla_time: float =  self._time_qs(model,field)
 
-        select_related_time: float = self._time_qs(model,field,"select")
+        select_related_time: float = self._time_qs(model,field,FieldOperation.SELECT_RELATED)
 
 
-        prefetch_related_time: float = self._time_qs(model,field,"prefetch")
+        prefetch_related_time: float = self._time_qs(model,field,FieldOperation.PREFETCH_RELATED)
 
         if prefetch_related_time < select_related_time:
             if prefetch_related_time < vanilla_time:
-                winner = "prefetch"
+                winner = FieldOperation.PREFETCH_RELATED
             else:
-                winner = "vanilla"
+                winner = FieldOperation.VANILLA
         else:
             if select_related_time  < vanilla_time:
-                winner = "select"
+                winner = FieldOperation.SELECT_RELATED
             else:
-                winner = "vanilla"
+                winner = FieldOperation.VANILLA
 
         return (winner, vanilla_time, select_related_time, prefetch_related_time)
         
