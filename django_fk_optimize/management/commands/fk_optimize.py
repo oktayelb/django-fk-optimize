@@ -1,12 +1,9 @@
-from os import times
-from xml.parsers.expat import model
-
 from django.core.management.base import BaseCommand , CommandError
 from django.db.models import Model, Field, ForeignObjectRel
 from django.apps.registry import apps
 
 import time
-from typing import Optional 
+from typing import Optional ,Any
 from enum import Enum
 
 
@@ -34,7 +31,7 @@ class Command(BaseCommand):
         select_fields : list[Field]  = []
         per_field_time_metrics: list[tuple[FieldOperation,float,float,float]] = []
 
-        model_fields: list[Field[any,any] | ForeignObjectRel] = model._meta.get_fields()
+        model_fields: list[Field[Any,Any] | ForeignObjectRel] = model._meta.get_fields()
         for field in model_fields:
             if not field.is_relation:
                 continue
@@ -82,7 +79,7 @@ class Command(BaseCommand):
             fields += prefetch_fields
 
         start_time: float = time.perf_counter()
-        
+
         # not so sur eabout this part
         # we might need to time the query and the N+1 part seperately
         for element in qs:
