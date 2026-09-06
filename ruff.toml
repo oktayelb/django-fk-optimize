@@ -1,0 +1,4 @@
+extend-exclude = ["django_fk_optimize/management/commands/m2o_optimize.py"]
+
+[lint]
+extend-select = ["I", "UP", "B"]

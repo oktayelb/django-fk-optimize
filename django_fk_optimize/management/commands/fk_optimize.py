@@ -1,10 +1,10 @@
-from django.core.management.base import BaseCommand , CommandError
-from django.db.models import Model, Field, ForeignObjectRel
-from django.apps.registry import apps
-
 import time
-from typing import Optional ,Any
 from enum import Enum
+from typing import Any
+
+from django.apps.registry import apps
+from django.core.management.base import BaseCommand, CommandError
+from django.db.models import Field, ForeignObjectRel, Model
 
 
 class FieldOperation(str, Enum):
@@ -12,64 +12,74 @@ class FieldOperation(str, Enum):
     SELECT_RELATED = "select_related"
     PREFETCH_RELATED = "prefetch_related"
 
-class Command(BaseCommand):
 
+class Command(BaseCommand):
     help = "Queryset optimizer tool for models containing foreign keys."
 
     def add_arguments(self, parser):
 
-        parser.add_argument("app.model", nargs="?", type=str , default= None)
+        parser.add_argument("app.model", nargs="?", type=str, default=None)
         parser.add_argument("--timeout", type=int)
         parser.add_argument(
             "--django-models",
-            action= "store_true",
-            help= "when set includes django (and third party) models"
+            action="store_true",
+            help="when set includes django (and third party) models",
         )
 
-    def _optimize_qs(self, model: type[Model]) ->tuple[list[tuple[FieldOperation,float,float,float]] ,dict[str,float]]:
+    def _optimize_qs(
+        self, model: type[Model]
+    ) -> tuple[list[tuple[str, FieldOperation, float, float, float]], dict[str, float]]:
         prefetch_fields: list[Field] = []
-        select_fields : list[Field]  = []
-        per_field_time_metrics: list[tuple[FieldOperation,float,float,float]] = []
+        select_fields: list[Field] = []
+        per_field_time_metrics: list[
+            tuple[str, FieldOperation, float, float, float]
+        ] = []
 
-        model_fields: list[Field[Any,Any] | ForeignObjectRel] = model._meta.get_fields()
+        model_fields: list[Field[Any, Any] | ForeignObjectRel] = (
+            model._meta.get_fields()
+        )
         for field in model_fields:
             if not field.is_relation:
                 continue
-            field_results = self._optimize_relation(model,field)
-            per_field_time_metrics.append(field_results)
+            field_results = self._optimize_relation(model, field)
+            per_field_time_metrics.append((field.name, *field_results))
             result = field_results[0]
             if result == FieldOperation.PREFETCH_RELATED:
                 prefetch_fields.append(field)
             elif result == FieldOperation.SELECT_RELATED:
                 select_fields.append(field)
 
-        final_times: dict[str,float] = {}
-        no_optimization_time = self._time_qs(model,vanilla_fields= model_fields)
-        suggested_optimization_time = self._time_qs(model,select_fields= select_fields,prefetch_fields=prefetch_fields)
+        final_times: dict[str, float] = {}
+        no_optimization_time = self._time_qs(model, vanilla_fields=model_fields)
+        suggested_optimization_time = self._time_qs(
+            model, select_fields=select_fields, prefetch_fields=prefetch_fields
+        )
         final_times["no_optimization_time"] = no_optimization_time
         final_times["suggested_optimization_time"] = suggested_optimization_time
 
-
         return per_field_time_metrics, final_times
-        
-    def _warmup_cache(self, model: type[Model], field : Optional[Field] = None, count:int = 3) -> None:
-        for i in range (0,count):
-            for i in model.objects.all():
-                getattr(i,field.name) if field else None
 
-    def _time_qs(self, model:type[Model],
-                *, 
-                prefetch_fields: Optional[list[Field]] = None,
-                select_fields: Optional[list[Field]]= None,
-                vanilla_fields: Optional[list[Field]]= None
-                ) -> float:
-        
+    def _warmup_cache(
+        self, model: type[Model], field: Field | None = None, count: int = 3
+    ) -> None:
+        for _i in range(0, count):
+            for element in model.objects.all():
+                getattr(element, field.name) if field else None
+
+    def _time_qs(
+        self,
+        model: type[Model],
+        *,
+        prefetch_fields: list[Field] | None = None,
+        select_fields: list[Field] | None = None,
+        vanilla_fields: list[Field] | None = None,
+    ) -> float:
+
         qs = model.objects.all()
         fields: list[Field] = []
         if vanilla_fields:
             fields += vanilla_fields
 
-        
         if select_fields:
             qs = qs.select_related(*(field.name for field in select_fields))
             fields += select_fields
@@ -84,22 +94,22 @@ class Command(BaseCommand):
         # we might need to time the query and the N+1 part seperately
         for element in qs:
             for field in fields:
-                getattr(element,field.name) if field else None
+                getattr(element, field.name) if field else None
         end_time: float = time.perf_counter()
         return end_time - start_time
 
-    def _optimize_relation(self, model: type[Model], field:Field ) -> tuple[FieldOperation, float, float, float]:
+    def _optimize_relation(
+        self, model: type[Model], field: Field
+    ) -> tuple[FieldOperation, float, float, float]:
 
-        self._warmup_cache(model=model,field=field)
+        self._warmup_cache(model=model, field=field)
         winner: FieldOperation = FieldOperation.VANILLA
 
+        vanilla_time: float = self._time_qs(model, vanilla_fields=[field])
 
-        vanilla_time: float =  self._time_qs(model,vanilla_fields=[field])
+        select_related_time: float = self._time_qs(model, select_fields=[field])
 
-        select_related_time: float = self._time_qs(model,select_fields=[field])
-
-
-        prefetch_related_time: float = self._time_qs(model,prefetch_fields=[field])
+        prefetch_related_time: float = self._time_qs(model, prefetch_fields=[field])
 
         if prefetch_related_time < select_related_time:
             if prefetch_related_time < vanilla_time:
@@ -107,20 +117,26 @@ class Command(BaseCommand):
             else:
                 winner = FieldOperation.VANILLA
         else:
-            if select_related_time  < vanilla_time:
+            if select_related_time < vanilla_time:
                 winner = FieldOperation.SELECT_RELATED
             else:
                 winner = FieldOperation.VANILLA
 
         return (winner, vanilla_time, select_related_time, prefetch_related_time)
-        
-    def _print_results(self, per_field_time_metrics: list[tuple[FieldOperation,float,float,float]],final_times: dict[str,float] ) -> None:
+
+    def _print_results(
+        self,
+        per_field_time_metrics: list[tuple[str, FieldOperation, float, float, float]],
+        final_times: dict[str, float],
+    ) -> None:
         def format_time(value: float | None) -> str:
             if value is None:
                 return "N/A"
             return f"{value:.6f}s"
 
-        self.stdout.write(self.style.MIGRATE_HEADING("Foreign key optimization results"))
+        self.stdout.write(
+            self.style.MIGRATE_HEADING("Foreign key optimization results")
+        )
 
         if not per_field_time_metrics:
             self.stdout.write("No per-field relation timings were collected.")
@@ -128,6 +144,7 @@ class Command(BaseCommand):
             self.stdout.write("Per-relation timings:")
             self.stdout.write(
                 f"{'#':<4}"
+                f"{'field':<24}"
                 f"{'winner':<18}"
                 f"{FieldOperation.VANILLA.value:>14}"
                 f"{FieldOperation.SELECT_RELATED.value:>18}"
@@ -140,6 +157,7 @@ class Command(BaseCommand):
                 FieldOperation.PREFETCH_RELATED: 0,
             }
             for index, (
+                field_name,
                 winner,
                 vanilla_time,
                 select_related_time,
@@ -148,6 +166,7 @@ class Command(BaseCommand):
                 operation_counts[winner] = operation_counts.get(winner, 0) + 1
                 self.stdout.write(
                     f"{index:<4}"
+                    f"{field_name:<24}"
                     f"{winner.value:<18}"
                     f"{format_time(vanilla_time):>14}"
                     f"{format_time(select_related_time):>18}"
@@ -171,7 +190,9 @@ class Command(BaseCommand):
         self.stdout.write("")
         self.stdout.write("Combined queryset timings:")
         self.stdout.write(f"No optimization: {format_time(no_optimization_time)}")
-        self.stdout.write(f"Suggested optimization: {format_time(suggested_optimization_time)}")
+        self.stdout.write(
+            f"Suggested optimization: {format_time(suggested_optimization_time)}"
+        )
 
         if no_optimization_time is None or suggested_optimization_time is None:
             return
@@ -197,37 +218,46 @@ class Command(BaseCommand):
                 )
             )
         else:
-            self.stdout.write("Suggested optimization matched the vanilla queryset timing.")
+            self.stdout.write(
+                "Suggested optimization matched the vanilla queryset timing."
+            )
 
-    def handle (self, *args,**options):
+    def handle(self, *args, **options):
 
-
-        selection :str | None  = options["app.model"]
-        model_s :list[type[Model]] = [] 
+        selection: str | None = options["app.model"]
+        model_s: list[type[Model]] = []
 
         try:
             if selection is None:
                 model_s = list(apps.get_models())
                 if not options["django_models"]:
-                    local_apps = {ac.label for ac in apps.get_app_configs()
-                            if not ac.name.startswith("django.")}
-                    model_s = [mdl for mdl in model_s if mdl._meta.app_label in local_apps]
-                
+                    local_apps = {
+                        ac.label
+                        for ac in apps.get_app_configs()
+                        if not ac.name.startswith("django.")
+                    }
+                    model_s = [
+                        mdl for mdl in model_s if mdl._meta.app_label in local_apps
+                    ]
+
             elif "." in selection:
                 model_s.append(apps.get_model(selection))
 
-            else:    
+            else:
                 for mdl in apps.get_app_config(selection).get_models():
                     model_s.append(mdl)
 
-        except (LookupError ,ValueError) as e:
+        except (LookupError, ValueError) as e:
             raise CommandError(str(e)) from e
 
-        
-        model_s = [mdl for mdl in model_s if any(f.is_relation for f in mdl._meta.get_fields())]
+        model_s = [
+            mdl for mdl in model_s if any(f.is_relation for f in mdl._meta.get_fields())
+        ]
 
         if not model_s:
-            self.stdout.write("No model found with a fk field. No  select_related/prefetch optimization can be done.")
+            self.stdout.write(
+                "No model found with a fk field. No  select_related/prefetch optimization can be done."
+            )
             return
 
         else:
