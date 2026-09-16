@@ -39,6 +39,20 @@ from ..recording import suppressed
 DEFAULT_SAMPLE_SIZE = 500
 DEFAULT_REPEAT = 5
 
+# Below this many rows a duration is not evidence.  The work being timed is
+# smaller than the noise floor of timing it, so whichever strategy comes out
+# ahead came out ahead by chance -- and on an empty table the query counts are
+# identical too, so there is nothing to measure at all.  Seen in the wild: a
+# forward ForeignKey on a table with no rows was recommended prefetch_related,
+# which is two queries where select_related is one.
+MIN_ROWS_FOR_TIMING = 5
+# Two timings this close to each other are the same timing.  A 3% win over
+# five runs on a shared machine is not a win.
+TIMING_TOLERANCE = 0.25
+
+MEASURED = "measured"
+STRUCTURAL = "structural"
+
 
 class FieldOperation(str, Enum):
     VANILLA = "vanilla"
@@ -173,6 +187,7 @@ class Measurement:
 
     seconds: float
     queries: int
+    rows: int = 0
 
 
 @dataclass
@@ -187,17 +202,65 @@ class RelationResult:
         return self.measurements.get(operation)
 
     @property
+    def rows(self) -> int:
+        return max((m.rows for m in self.measurements.values()), default=0)
+
+    @property
+    def decisive(self) -> bool:
+        """Whether the clock saw enough rows for its answer to mean anything."""
+        return self.rows >= MIN_ROWS_FOR_TIMING
+
+    @property
+    def basis(self) -> str:
+        return MEASURED if self.decisive else STRUCTURAL
+
+    def _structural(self) -> list[FieldOperation]:
+        """The order Django's own semantics put the strategies in.
+
+        Not a heuristic and not a guess about this table: a forward
+        many-to-one is one query with a join and two with a batch, and a
+        reverse or m2m relation cannot be joined at all.  `plan.strategies`
+        already encodes exactly that, so the fallback is to read it.
+        """
+        return [op for op in self.plan.strategies if op is not FieldOperation.VANILLA]
+
+    @property
     def best(self) -> Measurement | None:
         return self.measurements.get(self.winner)
 
     def ranked(self) -> list[tuple[FieldOperation, Measurement]]:
-        """Strategies fastest first, vanilla excluded -- the fixes on offer."""
+        """The fixes on offer, best first, vanilla excluded.
+
+        Best by the clock only when the clock has something to say.  Below
+        `MIN_ROWS_FOR_TIMING` the durations are noise and the order comes from
+        the relation kind instead; and even above it, a lead inside
+        `TIMING_TOLERANCE` is settled by query count, which is deterministic.
+        """
+        order = self._structural()
         offers = [
             (operation, measurement)
             for operation, measurement in self.measurements.items()
             if operation is not FieldOperation.VANILLA
         ]
+        if not offers:
+            return []
+
+        def structurally(pair):
+            operation = pair[0]
+            rank = order.index(operation) if operation in order else len(order)
+            return (pair[1].queries, rank)
+
+        if not self.decisive:
+            offers.sort(key=structurally)
+            return offers
+
         offers.sort(key=lambda pair: pair[1].seconds)
+        quickest = offers[0][1].seconds
+        tied = [pair for pair in offers if _close(pair[1].seconds, quickest)]
+        if len(tied) > 1:
+            head = min(tied, key=structurally)
+            offers.remove(head)
+            offers.insert(0, head)
         return offers
 
 
@@ -282,16 +345,18 @@ class Benchmark:
         plans,
         select=None,
         prefetch=None,
-    ) -> float:
+    ) -> tuple[float, int]:
         qs = self.queryset(model, select, prefetch)
         # suppressed() is entered before the clock starts: setting a
         # ContextVar is cheap, but it is not part of what is being timed.
+        rows = 0
         with suppressed():
             started = time.perf_counter()
             for row in qs:
+                rows += 1
                 for plan in plans:
                     self.touch(row, plan)
-            return time.perf_counter() - started
+            return time.perf_counter() - started, rows
 
     # -- measurement ---------------------------------------------------
 
@@ -311,14 +376,14 @@ class Benchmark:
         plans = list(plans)
         connection = connections[router.db_for_read(model) or DEFAULT_DB_ALIAS]
         with suppressed(), CaptureQueriesContext(connection) as captured:
-            self.run_once(model, plans, select, prefetch)
+            _warmup, rows = self.run_once(model, plans, select, prefetch)
         queries = len(captured.captured_queries)
 
         durations = [
-            self.run_once(model, plans, select, prefetch)
+            self.run_once(model, plans, select, prefetch)[0]
             for _attempt in range(self.repeat)
         ]
-        return Measurement(seconds=median(durations), queries=queries)
+        return Measurement(seconds=median(durations), queries=queries, rows=rows)
 
     def compare(self, model: type[Model], plan: RelationPlan) -> RelationResult:
         """Every strategy the relation supports, and which of them won."""
@@ -333,17 +398,37 @@ class Benchmark:
                 model, [plan], select=[plan.name]
             )
 
-        vanilla = measurements[FieldOperation.VANILLA].seconds
-        winner = min(measurements, key=lambda op: measurements[op].seconds)
-        if measurements[winner].seconds >= vanilla:
-            winner = FieldOperation.VANILLA
-
-        return RelationResult(plan=plan, winner=winner, measurements=measurements)
+        result = RelationResult(
+            plan=plan, winner=FieldOperation.VANILLA, measurements=measurements
+        )
+        offers = result.ranked()
+        if offers:
+            best, measurement = offers[0]
+            vanilla = measurements[FieldOperation.VANILLA]
+            # With too few rows to time, the clock cannot say a hint beats
+            # doing nothing either -- but the query counts can, and where even
+            # those tie the structural answer still holds.
+            beats_vanilla = (
+                measurement.seconds < vanilla.seconds
+                if result.decisive
+                else measurement.queries <= vanilla.queries
+            )
+            if beats_vanilla:
+                result.winner = best
+        return result
 
 
 # ----------------------------------------------------------------------
 # formatting shared by the reports
 # ----------------------------------------------------------------------
+
+
+def _close(left: float, right: float) -> bool:
+    """Whether two durations are near enough to be the same duration."""
+    slowest = max(abs(left), abs(right))
+    if slowest == 0:
+        return True
+    return abs(left - right) / slowest <= TIMING_TOLERANCE
 
 
 def format_measurement(measurement: Measurement | None, width: int = 22) -> str:

@@ -28,7 +28,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
-from .verdicts import ACTIONABLE_KINDS, REMOVE_HINT, Verdict
+from .verdicts import ACTIONABLE_KINDS, MEASURED, REMOVE_HINT, Verdict
 
 SCHEMA_VERSION = 1
 
@@ -177,10 +177,13 @@ def _current(verdict: Verdict) -> str:
     return f"{shape:<20}{' / '.join(timings)}".rstrip()
 
 
-def _strategy(name: str, measurement) -> str:
+def _strategy(name: str, measurement, basis: str = MEASURED) -> str:
+    # The duration is printed either way -- it was really taken -- but only
+    # the word "measured" claims it decided anything.
+    how = "measured" if basis == MEASURED else "not decisive"
     return (
         f"{name:<18}{queries(measurement.queries):<12}"
-        f"{milliseconds(measurement.seconds)} measured"
+        f"{milliseconds(measurement.seconds)} {how}"
     )
 
 
@@ -211,12 +214,21 @@ def _block(verdict: Verdict) -> list[tuple[str, str]]:
     if current != "unknown":
         lines.append(_row("current", current))
     if verdict.best is not None:
-        lines.append(_row("best", _strategy(verdict.best_strategy, verdict.best)))
+        lines.append(
+            _row(
+                "best",
+                _strategy(verdict.best_strategy, verdict.best, verdict.basis),
+            )
+        )
     if verdict.alternative is not None:
         lines.append(
             _row(
                 "alternative",
-                _strategy(verdict.alternative_strategy, verdict.alternative),
+                _strategy(
+                    verdict.alternative_strategy,
+                    verdict.alternative,
+                    verdict.basis,
+                ),
             )
         )
     if verdict.runtime_only:

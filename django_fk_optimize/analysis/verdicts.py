@@ -44,6 +44,8 @@ from ..utils.callsites import PROBABLE, RESOLVED, CallSite
 from ..utils.vocabulary import Vocabulary
 from .benchmark import (
     DEFAULT_SAMPLE_SIZE,
+    MEASURED,
+    STRUCTURAL,
     Deadline,
     FieldOperation,
     Measurement,
@@ -365,6 +367,10 @@ class Verdict:
 
     # what it costs now and what it could cost, as measured
     current: Measurement | None = None
+    # Whether the pick came off the clock or off the relation kind. A timing
+    # over too few rows is noise, and a pick made from noise must not print
+    # like a pick made from evidence.
+    basis: str = MEASURED
     best_strategy: str = ""
     best: Measurement | None = None
     alternative_strategy: str = ""
@@ -803,10 +809,16 @@ def cost(
         if not offers:
             continue
         verdict.current = result.get(FieldOperation.VANILLA)
+        verdict.basis = result.basis
         verdict.best_strategy, verdict.best = offers[0][0].value, offers[0][1]
         if len(offers) > 1:
             verdict.alternative_strategy = offers[1][0].value
             verdict.alternative = offers[1][1]
+        if result.basis == STRUCTURAL:
+            verdict.notes = verdict.notes + (
+                f"{result.rows} rows is too few to time; the hint comes from "
+                "the relation kind, not from the clock",
+            )
         fit(
             verdict,
             prefetch=verdict.best_strategy == FieldOperation.PREFETCH_RELATED.value,

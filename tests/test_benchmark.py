@@ -165,3 +165,97 @@ def test_a_whole_sweep_records_nothing(library, tmp_path):
 
     assert recorder.written == 0
     assert not path.exists()
+
+
+# -- what the clock is not allowed to decide ---------------------------
+
+
+def test_an_empty_table_is_never_decided_by_the_clock(library):
+    """The horizon-backend bug, reproduced.
+
+    `ScriptPolicy.script` was a plain ForeignKey on a table with no rows, and
+    the tool recommended prefetch_related -- two queries where select_related
+    is one. Both strategies had measured as noise and the sort picked one.
+    """
+    from tests.testapp.models import Book
+
+    Book.objects.all().delete()
+    plan = plan_named(Book, "publisher")
+
+    result = Benchmark(sample_size=200, repeat=1).compare(Book, plan)
+
+    assert result.rows == 0
+    assert result.decisive is False
+    assert result.basis == bench.STRUCTURAL
+    best = result.ranked()[0][0]
+    assert best is FieldOperation.SELECT_RELATED, (
+        "a forward many-to-one is one query with a join and two with a batch; "
+        "with no rows to time, that fact is the only thing left to go on"
+    )
+
+
+def test_a_populated_table_is_still_decided_by_measurement(library):
+    from tests.testapp.models import Book
+
+    plan = plan_named(Book, "publisher")
+    result = Benchmark(sample_size=200, repeat=1).compare(Book, plan)
+
+    assert result.rows >= bench.MIN_ROWS_FOR_TIMING
+    assert result.decisive is True
+    assert result.basis == bench.MEASURED
+
+
+def test_a_relation_that_cannot_be_joined_still_offers_prefetch(library):
+    """The structural fallback reads the relation kind, it does not assume."""
+    from tests.testapp.models import Publisher
+
+    Publisher.objects.all().delete()
+    plan = plan_named(Publisher, "book_set")
+    result = Benchmark(sample_size=200, repeat=1).compare(Publisher, plan)
+
+    assert result.decisive is False
+    assert [op for op, _ in result.ranked()] == [FieldOperation.PREFETCH_RELATED], (
+        "select_related() raises FieldError on a reverse many-to-one, so the "
+        "structural order must not offer it"
+    )
+
+
+def test_a_lead_inside_the_noise_band_is_settled_by_query_count():
+    """Above the row floor, a duration still has to win by a real margin."""
+    from django_fk_optimize.analysis.benchmark import Measurement, RelationResult
+    from tests.testapp.models import Book
+
+    plan = plan_named(Book, "publisher")
+    result = RelationResult(
+        plan=plan,
+        winner=FieldOperation.VANILLA,
+        measurements={
+            FieldOperation.VANILLA: Measurement(0.0100, 51, rows=50),
+            # prefetch is nominally quicker, but only by 2% -- noise.
+            FieldOperation.PREFETCH_RELATED: Measurement(0.00098, 2, rows=50),
+            FieldOperation.SELECT_RELATED: Measurement(0.00100, 1, rows=50),
+        },
+    )
+
+    assert result.decisive is True
+    assert result.ranked()[0][0] is FieldOperation.SELECT_RELATED
+
+
+def test_a_real_lead_is_left_alone():
+    from django_fk_optimize.analysis.benchmark import Measurement, RelationResult
+    from tests.testapp.models import Book
+
+    plan = plan_named(Book, "publisher")
+    result = RelationResult(
+        plan=plan,
+        winner=FieldOperation.VANILLA,
+        measurements={
+            FieldOperation.VANILLA: Measurement(0.0100, 51, rows=50),
+            FieldOperation.PREFETCH_RELATED: Measurement(0.0010, 2, rows=50),
+            FieldOperation.SELECT_RELATED: Measurement(0.0090, 1, rows=50),
+        },
+    )
+
+    assert result.ranked()[0][0] is FieldOperation.PREFETCH_RELATED, (
+        "a nine-fold win is evidence, and fewer queries must not override it"
+    )
