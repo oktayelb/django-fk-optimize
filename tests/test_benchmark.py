@@ -95,7 +95,15 @@ def test_the_recorder_still_works_around_the_benchmark(library, tmp_path):
 # -- comparison --------------------------------------------------------
 
 
-def test_compare_ranks_the_offers_fastest_first(library):
+def test_compare_ranks_the_offers_best_first(library):
+    """Best, which is fastest only when the clock won by a real margin.
+
+    This used to assert `offers[0].seconds <= offers[1].seconds` and was
+    flaky for it: on twelve rows the two strategies land within noise of each
+    other often enough, and the tie-break then puts the one with fewer
+    queries first even though it measured a hair slower. The head of the list
+    is the recommendation, not the stopwatch winner.
+    """
     from tests.testapp.models import Book
 
     result = Benchmark(sample_size=12, repeat=1).compare(
@@ -108,8 +116,15 @@ def test_compare_ranks_the_offers_fastest_first(library):
         FieldOperation.SELECT_RELATED,
         FieldOperation.PREFETCH_RELATED,
     }
-    assert offers[0][1].seconds <= offers[1][1].seconds
     assert dict(offers)[FieldOperation.SELECT_RELATED].queries == 1
+
+    (_best, first), (_next, second) = offers
+    if bench._close(first.seconds, second.seconds):
+        assert first.queries <= second.queries, (
+            "inside the noise band the deterministic number decides"
+        )
+    else:
+        assert first.seconds < second.seconds, "outside it, a real margin is left alone"
 
 
 def test_at_narrows_the_slice_and_never_widens_it(library):
