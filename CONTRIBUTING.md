@@ -85,6 +85,53 @@ before adding it. The floors — Django 4.2 and Python 3.10 — are what
 `pyproject.toml` claims, so anything that breaks the oldest cell is a bug in
 the code or a change to those floors, not a cell to drop.
 
+## The relation matrix
+
+`tests/test_matrix.py` does not list its cases. It enumerates every relation of
+every model in `tests/testapp` and checks the same invariants against all of
+them, so adding a model to the test app extends the matrix for free — and a
+shape nobody anticipated is still covered.
+
+Add a row for any new model in the `menagerie` fixture. The generated tests
+skip a model they cannot instantiate, and a skipped case is not coverage. Keep
+new rows out of `library`: several tests pin exact query counts against it, and
+a `Textbook` is a `Book`, so adding one there moves numbers all over the suite.
+
+One assertion there is deliberately tight rather than safe:
+`select_related()` must raise `FieldError` *exactly* when the plan refuses it.
+Asserting only that permitted joins work would let the classification quietly
+refuse legal ones, which is how the reverse one-to-one ended up recommended as
+a two-query prefetch.
+
+## The corpus
+
+`scripts/corpus.py` clones eight well-known Django projects and points the
+scanner at them. No database, no settings, no install of the project: the
+vocabulary is read out of source by `utils/static_vocabulary.py`, so a whole
+run is a shallow clone and a few seconds of parsing each.
+
+```bash
+python scripts/corpus.py                      # all of them
+python scripts/corpus.py --only wagtail       # one
+python scripts/corpus.py --write-baseline     # record new floors
+```
+
+It fails on a crash, or when `models`/`sites` fall below the floors in
+`scripts/corpus-baseline.json`. Those are floors and not exact counts because
+these projects keep moving; a pinned expectation would go red for their reasons
+rather than ours. Rewrite the baseline when a real improvement raises the
+numbers, and say so in the commit.
+
+It never fails on `sites_unresolved`. That is the coverage metric this project
+does not grade itself on: a queryset the scanner could not follow is a case we
+do not handle yet, and the number rising on a newly added project is a backlog
+item. Both of the scanner's biggest blind spots so far — models built on
+project-local abstract bases, and models fetched through `get_model()` — were
+found this way and not by the test suite.
+
+Adding a project is one line in `PROJECTS`. Prefer variety of modelling habits
+over fame.
+
 ## Commits
 
 Conventional Commits, imperative mood, lowercase subject, one logical change

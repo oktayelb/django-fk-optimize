@@ -3,6 +3,18 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+- Call-site analysis now covers reverse and many-to-many relations, not
+  just forward foreign keys. A related manager is treated as one: reading
+  it is free, `.all()`/`.count()`/`.exists()` are served by a prefetch, and
+  `.filter()`/`.first()` are not, so a hint is only offered where it helps.
+- The relation matrix in the test suite is generated from the app registry
+  rather than written by hand.
+- A vocabulary can be read out of source, with no project to import.
+- Models reached through a project-local abstract base or through
+  `get_model()` are resolved.
+- A new CI job scans eight real Django projects for crashes and coverage
+  regressions.
+
 ## 0.1.0 — unreleased
 
 First packaged release. `manage.py fk_optimize` measures what
