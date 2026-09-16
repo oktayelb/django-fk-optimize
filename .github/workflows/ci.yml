@@ -99,6 +99,38 @@ jobs:
           PGDATABASE: fk_optimize
         run: python -m pytest -q
 
+  # The suite is written by the same people as the code, so it encodes the same
+  # assumptions. This does not: it points the scanner at well-known Django
+  # projects nobody wrote for us, which is where shapes nobody anticipated
+  # live. No database and no `pip install` of the project -- the vocabulary is
+  # read out of source -- so it costs a shallow clone and a few seconds each.
+  #
+  # It fails on a crash or on a floor being breached. It never fails on
+  # `sites_unresolved`: a queryset the scanner could not follow is a case we do
+  # not handle yet, and that number is a backlog, not a regression.
+  corpus:
+    name: corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - run: python -m pip install "Django>=4.2"
+
+      - name: Scan real projects
+        run: python scripts/corpus.py --json corpus-report.json
+
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: corpus-report
+          path: corpus-report.json
+          if-no-files-found: warn
+
   lint:
     name: lint
     runs-on: ubuntu-latest

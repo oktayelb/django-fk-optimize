@@ -1,0 +1,50 @@
+{
+  "django-allauth": {
+    "model_parse_errors": 0,
+    "models": 22,
+    "parse_errors": 0,
+    "sites": 30
+  },
+  "django-cms": {
+    "model_parse_errors": 0,
+    "models": 150,
+    "parse_errors": 0,
+    "sites": 30
+  },
+  "django-helpdesk": {
+    "model_parse_errors": 0,
+    "models": 45,
+    "parse_errors": 0,
+    "sites": 64
+  },
+  "django-machina": {
+    "model_parse_errors": 0,
+    "models": 42,
+    "parse_errors": 0,
+    "sites": 3
+  },
+  "django-oscar": {
+    "model_parse_errors": 0,
+    "models": 244,
+    "parse_errors": 0,
+    "sites": 36
+  },
+  "misago": {
+    "model_parse_errors": 0,
+    "models": 100,
+    "parse_errors": 0,
+    "sites": 142
+  },
+  "readthedocs": {
+    "model_parse_errors": 0,
+    "models": 167,
+    "parse_errors": 0,
+    "sites": 115
+  },
+  "wagtail": {
+    "model_parse_errors": 0,
+    "models": 390,
+    "parse_errors": 0,
+    "sites": 368
+  }
+}
