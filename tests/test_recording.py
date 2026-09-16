@@ -174,6 +174,22 @@ def test_an_n_plus_one_over_a_real_fk_is_one_group(library, path):
     assert listings and all(g.kind == store.BULK for g in listings)
 
 
+def test_the_recorder_sees_exactly_the_queries_django_counts(library, path):
+    """The one count that can be checked against something other than itself."""
+    from django.test.utils import CaptureQueriesContext
+
+    from tests.testapp.models import Book
+
+    names = []
+    with CaptureQueriesContext(connection) as captured:
+        with recording.record(path):
+            for book in Book.objects.all():
+                names.append(book.publisher.name)
+
+    assert store.count_lines(path) == len(captured.captured_queries)
+    assert len(captured.captured_queries) == len(library["books"]) + 1
+
+
 def test_select_related_leaves_no_n_plus_one(library, path):
     from tests.testapp.models import Book
 
