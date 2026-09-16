@@ -1,0 +1,200 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run's answer worthless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  # The suite develops on one Django and one Python. Three claims this package
+  # makes -- that select_related() reaches across a reverse one-to-one, that
+  # argparse's BooleanOptionalAction behaves the same throughout, that the AST
+  # the scanner walks has not moved -- are only true if they are true on all of
+  # them. Corners plus a representative middle; not every cell.
+  test:
+    name: django ${{ matrix.django }} / python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {django: "4.2", python: "3.10"}   # oldest supported pair
+          - {django: "4.2", python: "3.12"}
+          - {django: "5.0", python: "3.11"}
+          - {django: "5.1", python: "3.12"}
+          - {django: "5.2", python: "3.10"}
+          - {django: "5.2", python: "3.13"}
+          - {django: "6.0", python: "3.12"}   # oldest python django 6.0 takes
+          - {django: "6.0", python: "3.14"}   # newest supported pair
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Django ${{ matrix.django }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "Django~=${{ matrix.django }}.0" "pytest>=7"
+
+      - name: Show what is actually installed
+        run: python -c "import sys, django; print(sys.version); print(django.get_version())"
+
+      - run: python -m pytest -q
+
+  # Everything above runs on sqlite, which is not a database this package can
+  # claim to support on its own evidence: cardinality emits COUNT(DISTINCT ...)
+  # and the store parses a quoted table name back out of the SQL Django wrote.
+  # Both are backend-shaped, so one job runs the whole suite against a real
+  # postgres.
+  postgres:
+    name: postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fk_optimize
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "Django>=6.0,<6.1" "pytest>=7" "psycopg[binary]>=3.1"
+
+      - name: Run the suite against postgres
+        env:
+          FK_OPTIMIZE_TEST_DB: postgres
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: fk_optimize
+        run: python -m pytest -q
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # Pinned: a ruff release that adds a rule should not turn a green branch
+      # red without anybody changing a line.
+      - run: python -m pip install ruff==0.15.20
+
+      - run: ruff check --output-format=github .
+
+      - run: ruff format --check .
+
+  # An editable install hides packaging mistakes: a module left out of the
+  # wheel is still importable from the tree next door. This builds the real
+  # artifacts and imports them from somewhere the source tree cannot reach.
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - run: python -m pip install --upgrade pip build twine
+
+      - run: python -m build
+
+      - run: python -m twine check dist/*
+
+      - name: Install the wheel into a clean virtualenv
+        run: |
+          python -m venv "$RUNNER_TEMP/wheelenv"
+          "$RUNNER_TEMP/wheelenv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/wheelenv/bin/pip" install dist/*.whl
+
+      - name: Import it, and find the command, from outside the source tree
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/wheelenv/bin/python" - <<'PY'
+          import django
+          import django_fk_optimize
+          from django.conf import settings
+
+          assert "site-packages" in django_fk_optimize.__file__, (
+              f"imported the source tree, not the wheel: {django_fk_optimize.__file__}"
+          )
+
+          settings.configure(INSTALLED_APPS=["django_fk_optimize"], DATABASES={})
+          django.setup()
+
+          from django.core.management import get_commands
+
+          assert get_commands().get("fk_optimize") == "django_fk_optimize", (
+              "fk_optimize is not a discoverable management command"
+          )
+          print("wheel ok:", django_fk_optimize.__file__)
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # The one that asserts the product rather than its parts: a real project with
+  # a real N+1, the command run as a gate, exit 1 with the relation named, then
+  # exit 0 once the printed fix is applied.
+  smoke:
+    name: smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # Built here rather than downloaded from `build`: one artifact handoff
+      # fewer is one thing fewer that can fail for a reason nobody cares about.
+      - name: Build and install the wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          python -m venv "$RUNNER_TEMP/smokeenv"
+          "$RUNNER_TEMP/smokeenv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/smokeenv/bin/pip" install dist/*.whl
+
+      # `python scripts/smoke.py` puts scripts/ on sys.path, not the repo root,
+      # so the wheel is what the throwaway project imports.
+      - name: Find the N+1, then stop finding it
+        run: "$RUNNER_TEMP/smokeenv/bin/python scripts/smoke.py"
