@@ -7,6 +7,7 @@ was named, where N came from, and what the verdict says to do.
 """
 
 import pytest
+from django.db import OperationalError, ProgrammingError
 
 from django_fk_optimize.analysis import verdicts as V
 from django_fk_optimize.analysis.cardinality import Cardinality
@@ -100,6 +101,15 @@ def counts(rows=12, present=12, distinct=3):
 # ----------------------------------------------------------------------
 # the join
 # ----------------------------------------------------------------------
+
+TWO_UNHINTED = """
+from tests.testapp.models import Book
+
+
+def listing():
+    for book in Book.objects.all():
+        send(book.publisher.name, book.author.name)
+"""
 
 SIMPLE = """
 from tests.testapp.models import Book
@@ -571,3 +581,84 @@ def test_findings_come_before_everything_else(vocabulary, tables):
     assert [verdict.actionable for verdict in verdicts] == sorted(
         [verdict.actionable for verdict in verdicts], reverse=True
     )
+
+
+# ----------------------------------------------------------------------
+# costing survives a database that cannot answer
+# ----------------------------------------------------------------------
+
+
+class _UnreadableTable:
+    """A benchmark whose table is not there, the way an unmigrated model is."""
+
+    def __init__(self, message='relation "testapp_book" does not exist'):
+        self.message = message
+        self.attempts = 0
+
+    def at(self, _rows):
+        return self
+
+    def compare(self, _model, _plan):
+        self.attempts += 1
+        raise ProgrammingError(self.message)
+
+
+def test_a_table_the_database_cannot_read_is_skipped_not_raised(vocabulary, tables):
+    """One unmigrated model must not take the whole run down.
+
+    A development database is half-migrated more often than not. Before this,
+    the first missing table aborted the command and every other verdict in the
+    run was lost with it.
+    """
+    from django_fk_optimize.analysis.benchmark import plans_for
+    from tests.testapp.models import Book
+
+    sites = sites_for(SIMPLE, vocabulary)
+    verdicts, _ = V.build(sites, [], vocabulary, tables, cardinality=counts())
+    finding = only(verdicts, V.N_PLUS_ONE)
+    assert plans_for(Book), "the relation has to be real for the skip to mean anything"
+
+    benchmark = _UnreadableTable()
+    costed = V.cost(verdicts, benchmark, lambda _label: Book)
+
+    assert benchmark.attempts == 1, "it should have tried before giving up"
+    assert costed.timed == 0
+    assert costed.skipped == 1
+    assert finding.best is None, "nothing may be presented as measured"
+    assert any("would not read this table" in note for note in finding.notes)
+    assert any("does not exist" in note for note in finding.notes)
+
+
+def test_the_skipped_relation_does_not_stop_the_next_one(vocabulary, tables):
+    """The verdict after the failure still gets priced."""
+    from django_fk_optimize.analysis.benchmark import (
+        FieldOperation,
+        Measurement,
+        RelationResult,
+        plan_named,
+    )
+    from tests.testapp.models import Book
+
+    priced = RelationResult(
+        plan=plan_named(Book, "publisher"),
+        winner=FieldOperation.SELECT_RELATED,
+        measurements={
+            FieldOperation.VANILLA: Measurement(0.010, 13),
+            FieldOperation.SELECT_RELATED: Measurement(0.001, 1),
+        },
+    )
+
+    class _FailsOnce(_UnreadableTable):
+        def compare(self, model, plan):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise OperationalError("permission denied for table testapp_book")
+            return priced
+
+    sites = sites_for(TWO_UNHINTED, vocabulary)
+    verdicts, _ = V.build(sites, [], vocabulary, tables, cardinality=counts())
+    costed = V.cost(verdicts, _FailsOnce(), lambda _label: Book)
+
+    assert costed.skipped == 1, "the unreadable one is skipped"
+    assert costed.timed == 1, "and the next one is still priced"
+    assert any(v.best is not None for v in verdicts), "the survivor kept its numbers"

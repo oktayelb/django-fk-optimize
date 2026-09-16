@@ -75,6 +75,7 @@ class Coverage:
 
     models: int = 0
     relations_benchmarked: int = 0
+    relations_skipped: int = 0
     benchmarked: bool = True
     scanned: bool = True
     timed_out: bool = False
@@ -291,7 +292,13 @@ def _coverage(coverage: Coverage) -> list[tuple[str, str]]:
         lines.append(
             _row(
                 "benchmark",
-                f"{plural(coverage.relations_benchmarked, 'relation')} timed",
+                f"{plural(coverage.relations_benchmarked, 'relation')} timed"
+                + (
+                    f", {coverage.relations_skipped} skipped "
+                    "(the database would not read the table)"
+                    if coverage.relations_skipped
+                    else ""
+                ),
             )
         )
     if coverage.timed_out:

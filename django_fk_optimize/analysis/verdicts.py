@@ -36,6 +36,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 
+from django.db import DatabaseError
+
 from ..recording.store import BULK, QueryGroup
 from ..recording.wrapper import PYTHON, SERIALIZER, TEMPLATE
 from ..utils.callsites import PROBABLE, RESOLVED, CallSite
@@ -740,18 +742,37 @@ def _runtime_verdict(match: Match) -> Verdict:
 # ----------------------------------------------------------------------
 
 
+def _brief(exc: Exception, limit: int = 70) -> str:
+    """The first line of a database error, short enough to sit in a note."""
+    text = " ".join(str(exc).split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+@dataclass(frozen=True)
+class Costed:
+    """How much of the costing actually happened.
+
+    `skipped` is not a tidy-up detail.  A run that priced 3 of 40 relations and
+    a run that priced all 40 print the same verdicts, and only this number
+    tells them apart.
+    """
+
+    timed: int = 0
+    skipped: int = 0
+
+
 def cost(
     verdicts: Iterable[Verdict],
     benchmark,
     model_for: Callable[[str], object | None],
     deadline: Deadline | None = None,
-) -> int:
+) -> Costed:
     """Time each verdict's alternative over a slice the size of its own N.
 
     Timed at the verdict's N, not at `--sample-size`: a loop over twelve rows
     is not explained by a measurement of five hundred.
     """
-    timed = 0
+    timed = skipped = 0
     for verdict in verdicts:
         if deadline is not None and deadline.expired():
             break
@@ -764,7 +785,20 @@ def cost(
         if plan is None:
             continue
         rows = verdict.rows.n if verdict.rows.known and verdict.rows.n else 1
-        result = benchmark.at(rows).compare(model, plan)
+        try:
+            result = benchmark.at(rows).compare(model, plan)
+        except DatabaseError as exc:
+            # A model whose migration has not been applied here, a table the
+            # connecting role cannot read, a column that has been renamed.  A
+            # development database is half-migrated more often than not, and
+            # one unreadable table is no reason to abandon the other thirty-
+            # nine: the verdict keeps its static half and says why it has no
+            # numbers.
+            verdict.notes = verdict.notes + (
+                f"not timed: the database would not read this table ({_brief(exc)})",
+            )
+            skipped += 1
+            continue
         offers = result.ranked()
         if not offers:
             continue
@@ -778,4 +812,4 @@ def cost(
             prefetch=verdict.best_strategy == FieldOperation.PREFETCH_RELATED.value,
         )
         timed += 1
-    return timed
+    return Costed(timed=timed, skipped=skipped)

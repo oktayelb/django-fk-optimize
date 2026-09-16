@@ -48,7 +48,7 @@ from ...analysis.benchmark import (
 )
 from ...analysis.cardinality import Cardinalities
 from ...analysis.report import Coverage, render_text
-from ...analysis.verdicts import Tables, build, cost
+from ...analysis.verdicts import Costed, Tables, build, cost
 from ...recording import store
 from ...utils.callsites import PROBABLE, RESOLVED, scan_files
 from ...utils.sources import discover
@@ -343,9 +343,9 @@ class Command(BaseCommand):
             and self._big_enough(verdict, cardinality, options["min_rows"])
         ]
 
-        timed = 0
+        costed = Costed()
         if options["benchmark"] and not deadline.expired():
-            timed = cost(verdicts, self.benchmark(), by_label.get, deadline)
+            costed = cost(verdicts, self.benchmark(), by_label.get, deadline)
 
         coverage = Coverage(
             files=scan.files,
@@ -364,7 +364,8 @@ class Command(BaseCommand):
             findings_runtime_only=len(joined.runtime_only),
             findings_unattributed=len(joined.unattributed),
             models=len(model_s),
-            relations_benchmarked=timed,
+            relations_benchmarked=costed.timed,
+            relations_skipped=costed.skipped,
             benchmarked=bool(options["benchmark"]),
             scanned=True,
             timed_out=deadline.hit,
