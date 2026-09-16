@@ -227,3 +227,86 @@ def test_the_scanner_runs_against_a_source_built_vocabulary(tmp_path):
     assert site.model == "shop.Book"
     assert site.touched == ("publisher",)
     assert site.missing == ("publisher",)
+
+
+# -- what a corpus run found that the hand-written cases did not -------
+
+
+OSCAR_SHAPE = """
+    from django.db import models
+
+
+    class AbstractPublisher(models.Model):
+        name = models.CharField(max_length=10)
+
+        class Meta:
+            abstract = True
+
+
+    class AbstractBook(models.Model):
+        publisher = models.ForeignKey("Publisher", on_delete=models.CASCADE)
+
+        class Meta:
+            abstract = True
+"""
+
+OSCAR_CONCRETE = """
+    from .abstract_models import AbstractBook, AbstractPublisher
+
+
+    class Publisher(AbstractPublisher):
+        pass
+
+
+    class Book(AbstractBook):
+        pass
+"""
+
+
+def test_a_model_is_found_through_a_project_local_abstract_base(tmp_path):
+    """`class Product(AbstractProduct)` names no base spelled like a model.
+
+    A name-only test finds 206 abstract classes in django-oscar and not one of
+    the concrete classes anybody queries, so the whole project scanned to zero
+    call sites.
+    """
+    root = tree(
+        tmp_path,
+        **{"shop/abstract_models.py": OSCAR_SHAPE, "shop/models.py": OSCAR_CONCRETE},
+    )
+
+    vocabulary, _stats = S.from_tree(root)
+
+    assert vocabulary.by_name("Book") is not None
+    assert vocabulary.by_name("Publisher") is not None
+
+
+def test_relations_are_inherited_from_the_abstract_base(tmp_path):
+    """The concrete class declares no fields at all; the base holds them."""
+    root = tree(
+        tmp_path,
+        **{"shop/abstract_models.py": OSCAR_SHAPE, "shop/models.py": OSCAR_CONCRETE},
+    )
+
+    vocabulary, _stats = S.from_tree(root)
+
+    book = vocabulary.by_name("Book")
+    assert book.relation("publisher") is not None
+    assert book.relation("publisher").target == "shop.Publisher"
+
+
+def test_an_abstract_base_does_not_originate_the_reverse_accessor(tmp_path):
+    """Both AbstractBook and Book carry the key; only one names the accessor.
+
+    Synthesising from both gives `abstractbook_set`, which no code writes.
+    """
+    root = tree(
+        tmp_path,
+        **{"shop/abstract_models.py": OSCAR_SHAPE, "shop/models.py": OSCAR_CONCRETE},
+    )
+
+    vocabulary, _stats = S.from_tree(root)
+    publisher = vocabulary.by_name("Publisher")
+
+    assert publisher.relation("book_set") is not None
+    assert publisher.relation("abstractbook_set") is None

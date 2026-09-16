@@ -39,10 +39,11 @@ FORWARD_FIELDS = {"ForeignKey", "OneToOneField"}
 M2M_FIELDS = {"ManyToManyField"}
 RELATION_FIELDS = FORWARD_FIELDS | M2M_FIELDS
 
-# A class is a model when something in its bases is spelled like one. Matching
-# on the name rather than resolving the base is deliberate: `TimeStampedModel`
-# from a third-party package cannot be resolved without importing it, and
-# treating it as a model is the useful failure.
+# A class is a model when a base is spelled like one -- or when a base is
+# itself a model, which has to be worked out rather than assumed. django-oscar
+# writes `class Product(AbstractProduct)`, and a name-only test finds no
+# concrete models in the whole project: 206 abstract classes and not one of
+# the classes anybody queries.
 MODEL_BASE_HINT = "Model"
 
 
@@ -65,23 +66,81 @@ class Stats:
 
 @dataclass
 class _Declared:
-    """One model class, before its targets have been resolved to labels."""
+    """One class, before model-ness and targets have been worked out."""
 
     name: str
     label: str
     module: str
+    bases: tuple[str, ...] = ()
+    looks_like_model: bool = False
     # (accessor, target_text, kind, related_name, nullable)
     fields: list[tuple[str, str, str, str | None, bool]] = dataclass_field(
         default_factory=list
     )
 
 
-def _is_model(node: ast.ClassDef) -> bool:
+def _base_names(node: ast.ClassDef) -> tuple[str, ...]:
+    names = []
     for base in node.bases:
         text = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
-        if text and MODEL_BASE_HINT in text:
-            return True
-    return False
+        if text:
+            names.append(text)
+    return tuple(names)
+
+
+def _looks_like_model(bases: tuple[str, ...]) -> bool:
+    return any(MODEL_BASE_HINT in text for text in bases)
+
+
+def _models_among(declared: list[_Declared]) -> set[str]:
+    """Which declared classes are models, by closure over their bases.
+
+    Seeded with the ones naming a base spelled like a model, then widened
+    until it stops growing: a class whose base is a model is a model. Without
+    the closure a project that puts its fields on abstract bases -- which is
+    the recommended way to write a pluggable Django app -- registers nothing
+    that anybody actually queries.
+    """
+    by_name: dict[str, list[_Declared]] = {}
+    for item in declared:
+        by_name.setdefault(item.name, []).append(item)
+
+    models = {item.name for item in declared if item.looks_like_model}
+    while True:
+        grown = {
+            item.name
+            for item in declared
+            if item.name not in models and any(base in models for base in item.bases)
+        }
+        if not grown:
+            return models
+        models |= grown
+
+
+def _inherited_fields(item: _Declared, by_name, seen=None) -> list:
+    """`item`'s own relations plus every base's, nearest last.
+
+    `class Product(AbstractProduct)` carries all of AbstractProduct's foreign
+    keys and declares none of its own; reading only the subclass finds a model
+    with no relations at all.
+    """
+    seen = seen if seen is not None else set()
+    if item.name in seen:
+        return list(item.fields)  # a cycle; own fields are still real
+    seen.add(item.name)
+
+    collected = []
+    for base in item.bases:
+        found = by_name.get(base) or []
+        if len(found) == 1:
+            collected.extend(_inherited_fields(found[0], by_name, seen))
+    collected.extend(item.fields)
+
+    # Nearest definition wins, so a subclass can override a base's field.
+    merged = {}
+    for field in collected:
+        merged[field[0]] = field
+    return list(merged.values())
 
 
 def _call_name(node) -> str:
@@ -145,12 +204,15 @@ def _declare(tree: ast.Module, path: Path, root: Path, stats: Stats):
     module = _module(path, root)
     found = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.ClassDef) or not _is_model(node):
+        if not isinstance(node, ast.ClassDef):
             continue
+        bases = _base_names(node)
         declared = _Declared(
             name=node.name,
             label=f"{label_app}.{node.name}",
             module=module,
+            bases=bases,
+            looks_like_model=_looks_like_model(bases),
         )
         for statement in node.body:
             if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
@@ -176,11 +238,23 @@ def _declare(tree: ast.Module, path: Path, root: Path, stats: Stats):
                 )
             )
         found.append(declared)
-    stats.models += len(found)
     return found
 
 
 def _resolve(declared: list[_Declared], stats: Stats) -> Vocabulary:
+    all_by_name: dict[str, list[_Declared]] = {}
+    for item in declared:
+        all_by_name.setdefault(item.name, []).append(item)
+
+    # Fields are inherited before model-ness is applied, so an abstract base
+    # can carry the relations for the concrete class that nobody declares.
+    for item in declared:
+        item.fields = _inherited_fields(item, all_by_name)
+
+    models = _models_among(declared)
+    declared = [item for item in declared if item.name in models]
+    stats.models += len(declared)
+
     by_name: dict[str, list[_Declared]] = {}
     for item in declared:
         by_name.setdefault(item.name, []).append(item)
@@ -211,8 +285,16 @@ def _resolve(declared: list[_Declared], stats: Stats) -> Vocabulary:
             all_relation_names=frozenset(name for name, _t, _k, _r, _n in item.fields),
         )
 
+    # A class other model classes inherit from is an abstract base often
+    # enough to treat it as one: `AbstractLine` and its concrete `Line` both
+    # carry the same foreign key, and synthesising the reverse accessor from
+    # both gives `abstractline_set`, which no code ever writes. The concrete
+    # leaf is the one whose name Django would use.
+    base_names = {base for item in declared for base in item.bases}
+
     for item in declared:
         info = infos[item.label]
+        originates_reverse = item.name not in base_names
         for name, text, kind, related_name, null in item.fields:
             target = label_for(text, item)
             if not target:
@@ -227,8 +309,8 @@ def _resolve(declared: list[_Declared], stats: Stats) -> Vocabulary:
             )
             stats.forward += 1
 
-            if related_name == "+":
-                continue  # no reverse accessor at all
+            if related_name == "+" or not originates_reverse:
+                continue  # no reverse accessor, or an abstract base's copy
             other = infos.get(target)
             if other is None:
                 continue
