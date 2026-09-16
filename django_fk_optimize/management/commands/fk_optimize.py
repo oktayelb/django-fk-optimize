@@ -263,6 +263,7 @@ class Command(BaseCommand):
 
     def _print_results(
         self,
+        model: type[Model],
         per_field_time_metrics: list[
             tuple[RelationPlan, FieldOperation, float, float | None, float]
         ],
@@ -273,8 +274,11 @@ class Command(BaseCommand):
                 return "N/A"
             return f"{value:.6f}s"
 
+        self.stdout.write("")
         self.stdout.write(
-            self.style.MIGRATE_HEADING("Foreign key optimization results")
+            self.style.MIGRATE_HEADING(
+                f"{model._meta.label} -- foreign key optimization results"
+            )
         )
 
         if not per_field_time_metrics:
@@ -402,7 +406,7 @@ class Command(BaseCommand):
             if deadline.expired():
                 break
             per_field_time_metrics, final_times = self._optimize_qs(mdl, deadline)
-            self._print_results(per_field_time_metrics, final_times)
+            self._print_results(mdl, per_field_time_metrics, final_times)
 
         if deadline.hit:
             self.stdout.write("")
