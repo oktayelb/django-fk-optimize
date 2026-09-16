@@ -100,6 +100,32 @@ def plan_for(field) -> RelationPlan | None:
     return None
 
 
+class Deadline:
+    """A real wall-clock budget for the whole run.
+
+    Checked between units of work rather than enforced with a signal: a
+    half-finished timing is worthless, but the timings already collected are
+    not, so the run stops at the next boundary and still reports.
+    """
+
+    def __init__(self, seconds: float | None):
+        self.seconds = seconds
+        self.started = time.monotonic()
+        self.hit = False
+
+    @property
+    def remaining(self) -> float | None:
+        if self.seconds is None:
+            return None
+        return self.seconds - (time.monotonic() - self.started)
+
+    def expired(self) -> bool:
+        remaining = self.remaining
+        if remaining is not None and remaining <= 0:
+            self.hit = True
+        return self.hit
+
+
 def plans_for(model: type[Model]) -> list[RelationPlan]:
     plans = []
     for field in model._meta.get_fields():
@@ -114,7 +140,15 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("app.model", nargs="?", type=str, default=None)
-        parser.add_argument("--timeout", type=int)
+        parser.add_argument(
+            "--timeout",
+            type=float,
+            default=None,
+            help=(
+                "wall-clock budget in seconds for the whole run; partial "
+                "results are still printed. Default: no limit."
+            ),
+        )
         parser.add_argument(
             "--django-models",
             action="store_true",
@@ -122,7 +156,7 @@ class Command(BaseCommand):
         )
 
     def _optimize_qs(
-        self, model: type[Model]
+        self, model: type[Model], deadline: Deadline
     ) -> tuple[
         list[tuple[RelationPlan, FieldOperation, float, float | None, float]],
         dict[str, float],
@@ -134,7 +168,11 @@ class Command(BaseCommand):
         ] = []
 
         plans = plans_for(model)
+        measured: list[RelationPlan] = []
         for plan in plans:
+            if deadline.expired():
+                break
+            measured.append(plan)
             field_results = self._optimize_relation(model, plan)
             per_field_time_metrics.append((plan, *field_results))
             winner = field_results[0]
@@ -144,10 +182,11 @@ class Command(BaseCommand):
                 select_names.append(plan.name)
 
         final_times: dict[str, float] = {}
-        final_times["no_optimization_time"] = self._time_qs(model, plans)
-        final_times["suggested_optimization_time"] = self._time_qs(
-            model, plans, select=select_names, prefetch=prefetch_names
-        )
+        if not deadline.expired():
+            final_times["no_optimization_time"] = self._time_qs(model, measured)
+            final_times["suggested_optimization_time"] = self._time_qs(
+                model, measured, select=select_names, prefetch=prefetch_names
+            )
         return per_field_time_metrics, final_times
 
     # -- measurement ---------------------------------------------------
@@ -358,6 +397,18 @@ class Command(BaseCommand):
             )
             return
 
+        deadline = Deadline(options["timeout"])
         for mdl in model_s:
-            per_field_time_metrics, final_times = self._optimize_qs(mdl)
+            if deadline.expired():
+                break
+            per_field_time_metrics, final_times = self._optimize_qs(mdl, deadline)
             self._print_results(per_field_time_metrics, final_times)
+
+        if deadline.hit:
+            self.stdout.write("")
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Run cut short after {deadline.seconds:g}s (--timeout); "
+                    "the results above are partial."
+                )
+            )
