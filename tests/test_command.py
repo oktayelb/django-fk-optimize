@@ -15,6 +15,7 @@ from django_fk_optimize.management.commands.fk_optimize import (
     FORWARD,
     MANY_TO_MANY,
     REVERSE,
+    REVERSE_ONE_TO_ONE,
     Command,
     Deadline,
     FieldOperation,
@@ -67,9 +68,12 @@ def test_reverse_one_to_one_is_not_a_manager():
 
     plan = plan_named(Author, "profile")
 
-    assert plan.kind == REVERSE
+    # A reverse one-to-one is the one reverse relation Django *can* join, and
+    # it hands back an instance rather than a manager. Both facts separate it
+    # from a reverse many-to-one, so it gets its own kind.
+    assert plan.kind == REVERSE_ONE_TO_ONE
     assert plan.many is False
-    assert plan.can_select_related is False
+    assert plan.can_select_related is True
 
 
 def test_many_to_many_is_never_select_related():

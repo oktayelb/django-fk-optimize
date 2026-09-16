@@ -1,181 +1,56 @@
-import time
-from dataclasses import dataclass
-from dataclasses import field as dataclass_field
-from enum import Enum
-from statistics import median
+"""The `fk_optimize` command.
+
+Orchestration only. Everything it reports comes out of `analysis/`: the
+relation classification and the timings from `analysis.benchmark`, and nothing
+is defined twice between the two.
+"""
 
 from django.apps.registry import apps
-from django.core.exceptions import ObjectDoesNotExist
 from django.core.management.base import BaseCommand, CommandError
-from django.db import DEFAULT_DB_ALIAS, connections, router
 from django.db.models import Model
-from django.db.models.fields.reverse_related import ForeignObjectRel
-from django.test.utils import CaptureQueriesContext
 
-
-class FieldOperation(str, Enum):
-    VANILLA = "vanilla"
-    SELECT_RELATED = "select_related"
-    PREFETCH_RELATED = "prefetch_related"
-
-
-# Every strategy is valid on a forward many-to-one / one-to-one: the related
-# row can be joined in, batched in, or fetched one query at a time.
-ALL_STRATEGIES = (
-    FieldOperation.VANILLA,
-    FieldOperation.SELECT_RELATED,
-    FieldOperation.PREFETCH_RELATED,
+from ...analysis.benchmark import (
+    ALL_STRATEGIES,
+    DEFAULT_REPEAT,
+    DEFAULT_SAMPLE_SIZE,
+    FORWARD,
+    MANY_TO_MANY,
+    NO_JOIN_STRATEGIES,
+    REVERSE,
+    REVERSE_ONE_TO_ONE,
+    Benchmark,
+    Deadline,
+    FieldOperation,
+    Measurement,
+    RelationPlan,
+    RelationResult,
+    describe_measurement,
+    format_measurement,
+    plan_for,
+    plans_for,
 )
-# Reverse and many-to-many relations cannot be joined into the parent row --
-# select_related() raises FieldError on them -- so only two strategies exist.
-NO_JOIN_STRATEGIES = (FieldOperation.VANILLA, FieldOperation.PREFETCH_RELATED)
 
-DEFAULT_SAMPLE_SIZE = 500
-DEFAULT_REPEAT = 5
-
-FORWARD = "forward"
-REVERSE = "reverse"
-MANY_TO_MANY = "m2m"
-
-
-@dataclass(frozen=True)
-class RelationPlan:
-    """How one relation has to be timed.
-
-    The two names differ and conflating them is the bug this exists to stop.
-    A reverse relation's `name` is the related_query_name ("book"), which is
-    what a filter takes; its accessor is "book_set", which is what an instance
-    answers to.  Passing one where the other belongs raises FieldError or
-    AttributeError, which is most of what made the old command crash.
-    """
-
-    name: str  # what select_related()/prefetch_related() take
-    accessor: str  # what getattr() on a row has to ask for
-    kind: str
-    many: bool  # the accessor hands back a manager, not an instance
-    strategies: tuple[FieldOperation, ...]
-
-    @property
-    def can_select_related(self) -> bool:
-        return FieldOperation.SELECT_RELATED in self.strategies
-
-
-def plan_for(field) -> RelationPlan | None:
-    """A timing plan for one entry of `Model._meta.get_fields()`, or None.
-
-    None means "there is nothing here to optimize": a hidden reverse relation
-    (related_name="+") has no accessor at all, a parent link is joined by
-    inheritance whatever we do, and a GenericForeignKey has no single related
-    model to join to.
-    """
-    if isinstance(field, ForeignObjectRel):
-        if field.hidden:
-            return None
-        accessor = field.get_accessor_name()
-        if not accessor:
-            return None
-        return RelationPlan(
-            name=accessor,
-            accessor=accessor,
-            kind=MANY_TO_MANY if field.many_to_many else REVERSE,
-            many=not field.one_to_one,
-            strategies=NO_JOIN_STRATEGIES,
-        )
-
-    if not getattr(field, "is_relation", False):
-        return None
-    if field.related_model is None:  # GenericForeignKey
-        return None
-    if field.many_to_many:
-        return RelationPlan(
-            name=field.name,
-            accessor=field.name,
-            kind=MANY_TO_MANY,
-            many=True,
-            strategies=NO_JOIN_STRATEGIES,
-        )
-    if getattr(field.remote_field, "parent_link", False):
-        return None
-    if field.many_to_one or field.one_to_one:
-        return RelationPlan(
-            name=field.name,
-            accessor=field.name,
-            kind=FORWARD,
-            many=False,
-            strategies=ALL_STRATEGIES,
-        )
-    return None
-
-
-@dataclass(frozen=True)
-class Measurement:
-    """What one strategy cost.
-
-    `queries` is the number a reviewer actually acts on: it is deterministic,
-    it does not move with machine load, and "21 queries became 1" is a claim
-    that survives being read on a different machine. `seconds` is the median
-    of several runs and is still only an indication.
-    """
-
-    seconds: float
-    queries: int
-
-
-@dataclass
-class RelationResult:
-    plan: RelationPlan
-    winner: FieldOperation
-    measurements: dict[FieldOperation, Measurement] = dataclass_field(
-        default_factory=dict
-    )
-
-
-class Deadline:
-    """A real wall-clock budget for the whole run.
-
-    Checked between units of work rather than enforced with a signal: a
-    half-finished timing is worthless, but the timings already collected are
-    not, so the run stops at the next boundary and still reports.
-    """
-
-    def __init__(self, seconds: float | None):
-        self.seconds = seconds
-        self.started = time.monotonic()
-        self.hit = False
-
-    @property
-    def remaining(self) -> float | None:
-        if self.seconds is None:
-            return None
-        return self.seconds - (time.monotonic() - self.started)
-
-    def expired(self) -> bool:
-        remaining = self.remaining
-        if remaining is not None and remaining <= 0:
-            self.hit = True
-        return self.hit
-
-
-def plans_for(model: type[Model]) -> list[RelationPlan]:
-    plans = []
-    for field in model._meta.get_fields():
-        plan = plan_for(field)
-        if plan is not None:
-            plans.append(plan)
-    return plans
-
-
-def format_measurement(measurement: Measurement | None, width: int = 22) -> str:
-    if measurement is None:
-        return "n/a".rjust(width)
-    return f"{measurement.seconds:.6f}s {measurement.queries:>4}q".rjust(width)
-
-
-def describe_measurement(measurement: Measurement | None) -> str:
-    if measurement is None:
-        return "not measured"
-    plural = "query" if measurement.queries == 1 else "queries"
-    return f"{measurement.seconds:.6f}s in {measurement.queries} {plural}"
+__all__ = [
+    "ALL_STRATEGIES",
+    "Benchmark",
+    "Command",
+    "DEFAULT_REPEAT",
+    "DEFAULT_SAMPLE_SIZE",
+    "Deadline",
+    "FORWARD",
+    "FieldOperation",
+    "MANY_TO_MANY",
+    "Measurement",
+    "NO_JOIN_STRATEGIES",
+    "REVERSE",
+    "REVERSE_ONE_TO_ONE",
+    "RelationPlan",
+    "RelationResult",
+    "describe_measurement",
+    "format_measurement",
+    "plan_for",
+    "plans_for",
+]
 
 
 class Command(BaseCommand):
@@ -248,45 +123,13 @@ class Command(BaseCommand):
 
     # -- measurement ---------------------------------------------------
 
-    def _touch(self, row: Model, plan: RelationPlan) -> None:
-        """Provoke the query a relation costs when it is not hinted.
+    def benchmark(self) -> Benchmark:
+        """A benchmark at the sizes this run was asked for.
 
-        A reverse or m2m accessor returns a related manager, and a manager
-        issues no query until something consumes it -- so merely reading the
-        attribute measures nothing at all.
+        Built per call rather than stored, so that `sample_size` and `repeat`
+        may be set on the command after it is constructed and still be read.
         """
-        try:
-            value = getattr(row, plan.accessor)
-        except ObjectDoesNotExist:
-            # A reverse one-to-one with no row on the other side.
-            return
-        if plan.many and value is not None:
-            for _related in value.all():
-                pass
-
-    def _run_once(
-        self,
-        model: type[Model],
-        plans: list[RelationPlan],
-        select: list[str] | None,
-        prefetch: list[str] | None,
-    ) -> float:
-        # A fresh queryset per run: a queryset caches its rows after the first
-        # evaluation, so reusing one would time an in-memory list.
-        # Ordered by pk so every strategy reads the same rows, and sliced so
-        # a timing never drags a whole table through memory.
-        qs = model.objects.all().order_by("pk")
-        if select:
-            qs = qs.select_related(*select)
-        if prefetch:
-            qs = qs.prefetch_related(*prefetch)
-        qs = qs[: self.sample_size]
-
-        start_time: float = time.perf_counter()
-        for row in qs:
-            for plan in plans:
-                self._touch(row, plan)
-        return time.perf_counter() - start_time
+        return Benchmark(self.sample_size, self.repeat)
 
     def _measure(
         self,
@@ -296,42 +139,12 @@ class Command(BaseCommand):
         select: list[str] | None = None,
         prefetch: list[str] | None = None,
     ) -> Measurement:
-        """Median of --repeat runs, after one warmup run that is discarded.
-
-        The warmup doubles as the query count: it runs under a debug cursor,
-        which is too slow to time but counts exactly.
-        """
-        connection = connections[router.db_for_read(model) or DEFAULT_DB_ALIAS]
-        with CaptureQueriesContext(connection) as captured:
-            self._run_once(model, plans, select, prefetch)
-        queries = len(captured.captured_queries)
-
-        durations = [
-            self._run_once(model, plans, select, prefetch)
-            for _attempt in range(self.repeat)
-        ]
-        return Measurement(seconds=median(durations), queries=queries)
+        return self.benchmark().measure(model, plans, select=select, prefetch=prefetch)
 
     def _optimize_relation(
         self, model: type[Model], plan: RelationPlan
     ) -> RelationResult:
-        measurements = {
-            FieldOperation.VANILLA: self._measure(model, [plan]),
-            FieldOperation.PREFETCH_RELATED: self._measure(
-                model, [plan], prefetch=[plan.name]
-            ),
-        }
-        if plan.can_select_related:
-            measurements[FieldOperation.SELECT_RELATED] = self._measure(
-                model, [plan], select=[plan.name]
-            )
-
-        vanilla = measurements[FieldOperation.VANILLA].seconds
-        winner = min(measurements, key=lambda op: measurements[op].seconds)
-        if measurements[winner].seconds >= vanilla:
-            winner = FieldOperation.VANILLA
-
-        return RelationResult(plan=plan, winner=winner, measurements=measurements)
+        return self.benchmark().compare(model, plan)
 
     # -- reporting -----------------------------------------------------
 
