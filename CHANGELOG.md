@@ -45,6 +45,23 @@ one relation at a time, instead of guessing from the model definitions.
   warmup and reports the median, instead of a single noisy `perf_counter` run.
 - A query-count column per strategy, captured with `CaptureQueriesContext`.
   Unlike a duration, it is deterministic and reproducible on another machine.
+- `django_fk_optimize.recording`: a query recorder built on Django's
+  `connection.execute_wrapper`, so it fires for celery tasks, management
+  commands and tests as well as for HTTP. Each query is stored as a normalised
+  shape with the user line that caused it, never with its parameters, in an
+  append-only JSONL file that can be folded into per-call-site groups. Bounded
+  by `MAX_RECORDS` and `SAMPLE_RATE`, silent on failure, and suppressible so
+  this package never records its own queries.
+- `FkOptimizeMiddleware`: the HTTP entry point for the recorder, sync and
+  async. Under ASGI the wrapper is installed on the thread that actually runs
+  the ORM rather than on the event loop.
+- An optional `FK_OPTIMIZE` settings dict — `RECORDING_PATH`, `ENABLED`,
+  `SAMPLE_SIZE`, `MAX_RECORDS`, `SAMPLE_RATE` — read lazily, with every key
+  optional and a bad value falling back to its default rather than raising.
+- Call sites now carry their enclosing scope (`function`, `scope_start`,
+  `scope_end`). A recorder attributes a lazy load to the line that touched the
+  relation, which is never the line that built the queryset, so the function is
+  what the static and runtime halves can be joined on.
 - `django_fk_optimize.utils`: the static-analysis package behind the call-site
   scanner — model vocabulary, per-module import resolution, queryset call-site
   detection and source discovery — is now part of the distribution.
