@@ -319,3 +319,112 @@ def test_scope_is_reachable_as_one_object(vocabulary):
 
     assert site.scope == Scope("f", 2, 4)
     assert site.scope.contains(3)
+
+
+# -- names bound by a dynamic model loader -----------------------------
+
+
+def test_get_model_with_literal_arguments_resolves(vocabulary):
+    """django-oscar and django-machina reach every model this way.
+
+    Both arguments are constants, so declining to read it is declining to read
+    the project: before this, oscar scanned to zero call sites from two
+    hundred models.
+    """
+    report = scan(
+        vocabulary,
+        """
+from oscar.core.loading import get_model
+
+Book = get_model("testapp", "Book")
+
+
+def listing():
+    for book in Book.objects.all():
+        send(book.publisher.name)
+""",
+        header="",
+    )
+
+    (site,) = report.sites
+    assert site.model == "testapp.Book"
+    assert site.touched == ("publisher",)
+
+
+def test_get_model_takes_the_dotted_form_too(vocabulary):
+    report = scan(
+        vocabulary,
+        """
+from django.apps import apps
+
+Book = apps.get_model("testapp.Book")
+
+
+def listing():
+    for book in Book.objects.all():
+        send(book.publisher.name)
+""",
+        header="",
+    )
+
+    (site,) = report.sites
+    assert site.model == "testapp.Book"
+
+
+def test_get_model_matches_the_app_label_case_insensitively(vocabulary):
+    report = scan(
+        vocabulary,
+        """
+from django.apps import apps
+
+Book = apps.get_model("TestApp", "Book")
+
+
+def listing():
+    for book in Book.objects.all():
+        send(book.publisher.name)
+""",
+        header="",
+    )
+
+    (site,) = report.sites
+    assert site.model == "testapp.Book"
+
+
+def test_a_computed_get_model_argument_is_not_guessed(vocabulary):
+    """A name built at import time is exactly what this must not invent."""
+    report = scan(
+        vocabulary,
+        """
+from django.apps import apps
+
+Book = apps.get_model(app_label, model_name)
+
+
+def listing():
+    for book in Book.objects.all():
+        send(book.publisher.name)
+""",
+        header="",
+    )
+
+    assert report.sites == []
+
+
+def test_get_model_for_a_model_that_does_not_exist_resolves_nothing(vocabulary):
+    report = scan(
+        vocabulary,
+        """
+from django.apps import apps
+
+Thing = apps.get_model("nowhere", "Thing")
+
+
+def listing():
+    for thing in Thing.objects.all():
+        send(thing.publisher.name)
+""",
+        header="",
+    )
+
+    assert report.sites == []

@@ -132,6 +132,19 @@ class Vocabulary:
     def by_qualname(self, qualname: str) -> ModelInfo | None:
         return self._by_qualname.get(qualname)
 
+    def by_label_parts(self, app: str, name: str) -> ModelInfo | None:
+        """A model from an app label and a class name, as get_model takes them.
+
+        Django matches both case-insensitively, so this does too. Falls back to
+        the bare name -- which refuses an ambiguous one -- because a static read
+        cannot always tell which app a class ended up registered under.
+        """
+        wanted = f"{app}.{name}".lower()
+        for info in self.models.values():
+            if info.label.lower() == wanted:
+                return info
+        return self.by_name(name)
+
     def by_name(self, name: str) -> ModelInfo | None:
         """A model by bare class name, or None when the name is ambiguous.
 

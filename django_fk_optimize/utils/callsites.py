@@ -279,6 +279,46 @@ class _Scanner:
         self._managers = {
             name for info in vocabulary.models.values() for name in info.managers
         }
+        self._aliases: dict[str, object] = {}
+        self._opaque: set[str] = set()
+        self._loaded_models()
+
+    def _loaded_models(self):
+        """Names bound by a dynamic model loader, which is still a literal.
+
+        `Product = get_model("catalogue", "Product")` is how django-oscar and
+        django-machina reach every model they have, and both arguments are
+        constants -- so refusing to read it is refusing to read the project.
+        Before this, oscar resolved nothing at all: two hundred models and not
+        one call site.
+        """
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            call = node.value
+            if not isinstance(target, ast.Name) or not isinstance(call, ast.Call):
+                continue
+            if _called(call.func) != "get_model":
+                continue
+            info = self._model_from_labels(_string_args(call))
+            if info is not None:
+                self._aliases[target.id] = info
+            else:
+                # The name was bound by a loader we could not read, so the
+                # class name is not evidence about which model came back.
+                # Falling through to the bare-name lookup would be a guess
+                # dressed up as a resolution.
+                self._opaque.add(target.id)
+
+    def _model_from_labels(self, args):
+        if len(args) == 2:
+            app, name = args
+        elif len(args) == 1 and "." in args[0]:
+            app, name = args[0].split(".", 1)
+        else:
+            return None
+        return self.vocabulary.by_label_parts(app, name)
 
     def run(self):
         self._scope_of(self.tree.body, {}, _module_scope(self.tree))
@@ -454,6 +494,11 @@ class _Scanner:
     # -- resolution ----------------------------------------------------
 
     def _model_from_name(self, name):
+        alias = self._aliases.get(name)
+        if alias is not None:
+            return alias
+        if name in self._opaque:
+            return None
         qualname = self.imports.names.get(name)
         if qualname:
             found = self.vocabulary.by_qualname(qualname)
@@ -538,6 +583,24 @@ def _function_scope(node) -> Scope:
     # Decorators sit above `node.lineno`, so a site cannot be inside one and
     # the span deliberately starts at the `def`.
     return Scope(node.name, node.lineno, _end_line(node, node.lineno))
+
+
+def _called(node) -> str:
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return ""
+
+
+def _string_args(call: ast.Call) -> list[str]:
+    args = []
+    for arg in call.args:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            args.append(arg.value)
+        else:
+            return []
+    return args
 
 
 def _unwind(node):
