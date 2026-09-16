@@ -260,8 +260,12 @@ def run(*args, **options):
 
 
 def test_whole_app_runs_without_raising(library):
-    """The regression test: this used to die on the first reverse relation."""
-    output = run("testapp", "--repeat", "1", "--sample-size", "5")
+    """The regression test: this used to die on the first reverse relation.
+
+    --no-callsites is the mode this sweep survives in: with no source to join
+    to there is no verdict to give, only what every relation costs.
+    """
+    output = run("testapp", "--no-callsites", "--repeat", "1", "--sample-size", "5")
 
     for label in (
         "testapp.Publisher",
@@ -289,7 +293,9 @@ def test_whole_app_runs_without_raising(library):
 
 
 def test_single_model_run_is_labelled(library):
-    output = run("testapp.Book", "--repeat", "1", "--sample-size", "5")
+    output = run(
+        "testapp.Book", "--no-callsites", "--repeat", "1", "--sample-size", "5"
+    )
 
     assert "testapp.Book -- foreign key optimization results" in output
     assert "testapp.Author --" not in output
