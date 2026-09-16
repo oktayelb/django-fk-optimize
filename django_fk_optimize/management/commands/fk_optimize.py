@@ -379,7 +379,10 @@ class Command(BaseCommand):
                 )
 
             self.stdout.write("")
-            self.stdout.write("Suggested operations:")
+            self.stdout.write(
+                "Suggested operations (each relation measured on its own -- "
+                "see the combined result below before applying them together):"
+            )
             self.stdout.write(
                 f"{FieldOperation.SELECT_RELATED.value}: "
                 f"{operation_counts[FieldOperation.SELECT_RELATED]}, "
@@ -412,11 +415,23 @@ class Command(BaseCommand):
                 )
             )
         elif difference < 0:
+            # Each winner above beat vanilla alone. Applied together they need
+            # not: two select_related() joins multiply rows, and the product of
+            # two individually cheap joins can be worse than the N+1 it
+            # replaced. The measurement already knows this; say so rather than
+            # hand back the per-relation winners as a safe set.
             self.stdout.write(
                 self.style.WARNING(
-                    f"Suggested optimization is slower by {abs(difference):.6f}s "
-                    f"({abs(percentage):.2f}%)."
+                    f"Suggested optimization measured SLOWER than no "
+                    f"optimization, by {abs(difference):.6f}s "
+                    f"({abs(percentage):.2f}%), even though it used "
+                    f"{vanilla.queries - suggested.queries} fewer queries."
                 )
+            )
+            self.stdout.write(
+                "Do not apply the winners above as a set. Joins combine "
+                "multiplicatively; adopt them one at a time, re-running this "
+                "command after each, and keep the ones that still help."
             )
         else:
             self.stdout.write(
