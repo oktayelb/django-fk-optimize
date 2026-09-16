@@ -291,3 +291,78 @@ def test_the_json_carries_both_axes():
     assert payload["confidence"] == RESOLVED
     assert payload["evidence"] == V.EVIDENCE_NONE
     assert payload["basis"] == V.MEASURED
+
+
+def test_a_structural_pick_never_quotes_a_saving():
+    """Durations taken over too few rows must not become a claim.
+
+    Seen on a real project: "saving ~-0.1 ms per call (-34%)" -- a negative
+    saving, printed for a change the tool was recommending, computed from two
+    timings that were both noise.
+    """
+    from django_fk_optimize.analysis import verdicts as V
+
+    verdict = V.Verdict(
+        kind=V.EXTRA_QUERY,
+        model="testapp.Book",
+        relation="publisher",
+        rows=V.Rows(1, V.STATIC_BOUND),
+        confidence=RESOLVED,
+        actionable=True,
+        basis=V.STRUCTURAL,
+        current=Measurement(0.0004, 1, rows=0),
+        best_strategy="select_related",
+        best=Measurement(0.0005, 1, rows=0),
+    )
+
+    assert verdict.measured is False, "noise is not a measurement"
+    assert verdict.saved_seconds is None
+
+    text = text_of([verdict], report.Coverage())
+    assert "too few rows to time" in text
+    assert "-0.1 ms" not in text
+    assert "~-" not in text
+
+
+def test_a_real_measurement_still_quotes_its_saving():
+    from django_fk_optimize.analysis import verdicts as V
+
+    verdict = V.Verdict(
+        kind=V.N_PLUS_ONE,
+        model="testapp.Book",
+        relation="publisher",
+        rows=V.Rows(60, V.OBSERVED),
+        confidence=RESOLVED,
+        actionable=True,
+        basis=V.MEASURED,
+        current=Measurement(0.0100, 61, rows=60),
+        best_strategy="select_related",
+        best=Measurement(0.0010, 1, rows=60),
+    )
+
+    assert verdict.measured is True
+    text = text_of([verdict], report.Coverage())
+    assert "60 fewer queries" in text
+
+
+def test_the_confidence_column_never_collides_with_the_saving():
+    from django_fk_optimize.analysis import verdicts as V
+
+    verdict = V.Verdict(
+        kind=V.N_PLUS_ONE,
+        model="testapp.Book",
+        relation="publisher",
+        rows=V.Rows(1234567, V.OBSERVED),
+        confidence=RESOLVED,
+        actionable=True,
+        current=Measurement(0.5, 1234568, rows=1234567),
+        best_strategy="select_related",
+        best=Measurement(0.001, 1, rows=1234567),
+    )
+    line = next(
+        line
+        for line, _style in report.render_text([verdict], report.Coverage())
+        if "confidence:" in line
+    )
+    assert "queriesconfidence" not in line
+    assert "  confidence:" in line

@@ -420,7 +420,18 @@ class Verdict:
 
     @property
     def measured(self) -> bool:
-        return self.current is not None and self.best is not None
+        """Whether there are numbers here that are worth quoting.
+
+        A structural pick has durations attached -- they were really taken --
+        but they did not decide anything and the difference between them is
+        noise. Quoting a saving off them produces things like "saves -0.1 ms",
+        which is worse than saying nothing.
+        """
+        return (
+            self.current is not None
+            and self.best is not None
+            and self.basis == MEASURED
+        )
 
     @property
     def saved_seconds(self) -> float | None:

@@ -200,11 +200,13 @@ def _saving(verdict: Verdict) -> str:
             f"~{milliseconds(verdict.saved_seconds)} per call{percent}, "
             f"{verdict.saved_queries} fewer queries"
         )
+    elif verdict.basis != MEASURED and verdict.best is not None:
+        saved = f"{queries(verdict.best.queries)} once fixed, too few rows to time"
     elif verdict.rows.known and verdict.rows.n > 0:
         saved = f"{verdict.rows.n} queries per call, not timed"
     else:
         saved = "not timed"
-    return f"{saved:<40}{confidence}"
+    return f"{saved:<48}  {confidence}"
 
 
 def _block(verdict: Verdict) -> list[tuple[str, str]]:
