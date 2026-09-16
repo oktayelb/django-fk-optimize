@@ -210,3 +210,84 @@ def test_age_is_readable():
     assert report.age(120) == "2 minutes old"
     assert report.age(3600) == "1 hour old"
     assert report.age(172800) == "2 days old"
+
+
+def test_evidence_is_reported_separately_from_confidence():
+    """`resolved` says which call site this is, not that the number is good.
+
+    On a half-populated development database most suggestions rest on tables
+    with no rows. Printing only `confidence: resolved` beside `rows 0` read as
+    confidence in the recommendation.
+    """
+    from django_fk_optimize.analysis import verdicts as V
+
+    grounded = V.Verdict(
+        kind=V.N_PLUS_ONE,
+        model="testapp.Book",
+        relation="publisher",
+        rows=V.Rows(60, V.OBSERVED),
+        confidence=RESOLVED,
+        actionable=True,
+        file="views.py",
+        line=6,
+    )
+    empty = V.Verdict(
+        kind=V.N_PLUS_ONE,
+        model="testapp.Book",
+        relation="publisher",
+        rows=V.Rows(0, V.UNKNOWN),
+        confidence=RESOLVED,
+        actionable=True,
+        file="views.py",
+        line=9,
+    )
+
+    assert grounded.evidence == V.EVIDENCE_OBSERVED
+    assert empty.evidence == V.EVIDENCE_NONE
+
+    text = text_of([grounded, empty], report.Coverage())
+    assert "confidence: resolved · evidence: observed" in text
+    assert "confidence: resolved · evidence: none" in text
+
+
+def test_an_estimated_row_count_is_evidence_but_weaker():
+    from django_fk_optimize.analysis import verdicts as V
+
+    verdict = V.Verdict(
+        kind=V.N_PLUS_ONE,
+        model="testapp.Book",
+        relation="publisher",
+        rows=V.Rows(60, V.ESTIMATED),
+        confidence=RESOLVED,
+    )
+    assert verdict.evidence == V.EVIDENCE_ESTIMATED
+
+
+def test_an_unused_hint_needs_no_rows_to_be_certain():
+    """Removing a hint is a static fact, not a claim about today's data."""
+    from django_fk_optimize.analysis import verdicts as V
+
+    verdict = V.Verdict(
+        kind=V.REMOVE_HINT,
+        model="testapp.Book",
+        relation="author",
+        rows=V.Rows(0, V.UNKNOWN),
+        confidence=RESOLVED,
+    )
+    assert verdict.evidence == V.EVIDENCE_OBSERVED
+
+
+def test_the_json_carries_both_axes():
+    from django_fk_optimize.analysis import verdicts as V
+
+    verdict = V.Verdict(
+        kind=V.N_PLUS_ONE,
+        model="testapp.Book",
+        relation="publisher",
+        rows=V.Rows(0, V.UNKNOWN),
+        confidence=RESOLVED,
+    )
+    payload = report.verdict_json(verdict)
+    assert payload["confidence"] == RESOLVED
+    assert payload["evidence"] == V.EVIDENCE_NONE
+    assert payload["basis"] == V.MEASURED

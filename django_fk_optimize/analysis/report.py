@@ -188,7 +188,9 @@ def _strategy(name: str, measurement, basis: str = MEASURED) -> str:
 
 
 def _saving(verdict: Verdict) -> str:
-    confidence = f"confidence: {verdict.confidence}"
+    # Two axes, named separately: which call site this is, and how much
+    # the number beside it is worth.
+    confidence = f"confidence: {verdict.confidence} · evidence: {verdict.evidence}"
     if verdict.kind == REMOVE_HINT:
         saved = "one join per call, not timed"
     elif verdict.measured and verdict.saved_seconds is not None:
@@ -202,7 +204,7 @@ def _saving(verdict: Verdict) -> str:
         saved = f"{verdict.rows.n} queries per call, not timed"
     else:
         saved = "not timed"
-    return f"{saved:<44}{confidence}"
+    return f"{saved:<40}{confidence}"
 
 
 def _block(verdict: Verdict) -> list[tuple[str, str]]:
@@ -386,6 +388,8 @@ def verdict_json(verdict: Verdict) -> dict:
         "kind": verdict.kind,
         "actionable": verdict.actionable,
         "confidence": verdict.confidence,
+        "evidence": verdict.evidence,
+        "basis": verdict.basis,
         "file": verdict.file,
         "line": verdict.line,
         "function": verdict.function,

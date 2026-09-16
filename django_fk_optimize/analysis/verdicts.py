@@ -59,6 +59,14 @@ STATIC_BOUND = "static bound"
 ESTIMATED = "estimated"
 UNKNOWN = "unknown"
 
+# How much the saving is worth believing, which is not the same question as
+# how sure we are that we found the right call site. `confidence` answers the
+# second; printing it alone next to "rows 0" made it look like an answer to
+# the first.
+EVIDENCE_OBSERVED = "observed"
+EVIDENCE_ESTIMATED = "estimated"
+EVIDENCE_NONE = "none"
+
 # What a verdict says to do.
 N_PLUS_ONE = "n_plus_one"
 EXTRA_QUERY = "extra_query"
@@ -388,6 +396,24 @@ class Verdict:
     @property
     def target(self) -> str:
         return f"{self.model}.{self.relation}" if self.relation else self.model
+
+    @property
+    def evidence(self) -> str:
+        """How much the saving is worth believing.
+
+        A verdict about a table with no rows has a real call site and no
+        evidence at all for what fixing it would save. Those are two different
+        claims and they get two different words.
+        """
+        if self.kind == REMOVE_HINT:
+            # An unused hint is a static fact: the relation is never touched
+            # here, whatever the table happens to hold today.
+            return EVIDENCE_OBSERVED
+        if not self.rows.known or self.rows.n <= 0:
+            return EVIDENCE_NONE
+        if self.rows.provenance == OBSERVED:
+            return EVIDENCE_OBSERVED
+        return EVIDENCE_ESTIMATED
 
     @property
     def measured(self) -> bool:
