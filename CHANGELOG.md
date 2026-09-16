@@ -39,6 +39,44 @@ one relation at a time, instead of guessing from the model definitions.
 
 ### Added
 
+- **`fk_optimize` now reports call sites, not just models.** The default run
+  scans the project's source for querysets, reads the query recording, joins
+  the two, and prints one block per finding: the row count and where that
+  count came from, what the call site costs now, what the best alternative
+  measures, the exact one-line change to make, and the confidence. When
+  nothing is worth changing it says so in one line rather than printing an
+  empty table.
+- `django_fk_optimize.analysis`: `benchmark` (relation classification and
+  bounded, repeated, median timing), `cardinality` (COUNT-based row and
+  distinct-target stats), `verdicts` (the static/runtime join and the rules)
+  and `report` (text and JSON rendering).
+- The static and runtime halves are joined on the **enclosing function**, not
+  on the line. The scanner files a call site at the line that built the
+  queryset and the recorder attributes the lazy load to the line that touched
+  the relation, so the two are never the same line. The narrowest containing
+  scope wins, and the match is confirmed by resolving the site's relation to
+  its target table and requiring that to be the table the repeated query read.
+  Both signals agree: `resolved`. One of them: `probable`.
+- Queries no AST could ever see — a `{{ book.publisher.name }}` in a template,
+  a DRF serializer field — are reported as runtime-only findings with the
+  relation inferred from the queried table, instead of being dropped.
+- Every verdict says where its row count came from: `observed` from the
+  recording, `static bound` from a `[:50]` or a `get()`, or `estimated` from a
+  COUNT. An estimate is never printed as a measurement.
+- A mandatory coverage block under every report and in every `--json` payload:
+  files scanned, call sites resolved and probable, querysets the scanner could
+  not follow, files it could not parse, records read, malformed lines, the age
+  of the recording, and how many findings were traced to a call site.
+- New flags: `--callsites/--no-callsites`, `--benchmark/--no-benchmark`,
+  `--recording PATH`, `--clear-recording`, `--min-rows N`,
+  `--json [PATH]`, `--fail-on-findings` (non-zero exit for CI) and
+  `--include-django`.
+- A call site whose only touch is the column attribute (`book.publisher_id`)
+  is reported as already optimal. A hint for a relation the site never touches
+  is offered for removal.
+- Reverse one-to-one relations are offered `select_related()`. Django joins
+  the reverse side of a `OneToOneField` and caches the absence of a row as
+  well as its presence, so a parent with no child costs no extra query either.
 - `--sample-size` (default 500) bounds every timed queryset. Timings used to
   walk the whole table, three times per relation plus warmups.
 - `--repeat` (default 5) runs each strategy that many times after a discarded
@@ -72,6 +110,17 @@ one relation at a time, instead of guessing from the model definitions.
 
 ### Changed
 
+- `--django-models` is deprecated in favour of `--include-django`. It still
+  works and prints a deprecation notice.
+- Relation classification and timing moved out of the management command into
+  `analysis/benchmark.py`, so there is one definition of "is this relation
+  joinable?" rather than one per caller. A reverse one-to-one now has its own
+  relation kind, since it is the one reverse relation Django can join and the
+  one that hands back an instance rather than a manager.
+- `--no-callsites` keeps the old per-relation sweep. With no source to join
+  to there is no verdict to give, only what each strategy costs on this
+  database — which is still the only thing that covers reverse and
+  many-to-many relations.
 - The app config gains `label`, `verbose_name` and `default_auto_field`; without
   the last one the app raised `models.W042` in projects that had not set
   `DEFAULT_AUTO_FIELD`.
