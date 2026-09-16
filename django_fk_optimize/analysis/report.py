@@ -229,7 +229,7 @@ def _one_liner(verdict: Verdict) -> tuple[str, str]:
     where = (
         f"{relative(verdict.file)}:{verdict.line}" if verdict.file else "(unattributed)"
     )
-    return (f"  {pad(where, 44)}  {pad(verdict.target, 28)}  {verdict.headline}", PLAIN)
+    return (f"  {pad(where, 34)}  {pad(verdict.target, 26)}  {verdict.headline}", PLAIN)
 
 
 def _coverage(coverage: Coverage) -> list[tuple[str, str]]:
