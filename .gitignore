@@ -1,0 +1,26 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+
+# Local-only working files, deliberately not part of the package
+CLAUDE.md
+.codex
+django_fk_optimize/management/commands/m2o_optimize.py
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Tool caches and coverage
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Recordings this tool writes into a project
+.fk_optimize/
