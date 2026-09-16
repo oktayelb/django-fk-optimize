@@ -7,6 +7,7 @@ thirteen queries into one on any machine on any day.
 
 import io
 import json
+import re
 
 import pytest
 from django.core.management import call_command
@@ -373,7 +374,12 @@ def test_a_recording_turns_the_estimate_into_an_observation(recorded):
     assert "book_list()" in output
     assert "13 records" in output  # one page query, then one per book
     assert "1 to a call site" in output
-    assert 'select_related("publisher")' in output
+    # Which hint wins is decided by a stopwatch, so the assertion is on the
+    # relation and the shape of the fix, never on the method that won.
+    assert re.search(
+        r'fix\s+Book\.objects\.all\(\)\.(select|prefetch)_related\("publisher"\)',
+        output,
+    )
 
 
 def test_the_id_only_call_site_is_reported_as_fine_not_as_a_finding(library, tmp_path):
@@ -548,7 +554,11 @@ def test_a_template_n_plus_one_is_reported_with_no_call_site(library, tmp_path):
     assert "40  (observed)" in output
     assert "template" in output
     assert "no call site" in output
-    assert 'add .select_related("publisher")' in output
+    assert re.search(
+        r'add \.(select|prefetch)_related\("publisher"\) to the '
+        r"testapp\.Book queryset in catalogue\(\)",
+        output,
+    )
     assert "catalogue()" in output
     assert "1 with no call site" in output
 
