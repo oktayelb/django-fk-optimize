@@ -301,8 +301,15 @@ class Recorder:
 
     # -- lifecycle -----------------------------------------------------
 
-    def start(self):
-        """Activate and install. Never raises."""
+    def start(self, install: bool = True):
+        """Activate and install. Never raises.
+
+        `install=False` is for ASGI, where the wrapper has to go onto the
+        connection of the thread that will actually run the ORM -- a
+        `sync_to_async` executor thread, not the event loop the request lives
+        on.  The ContextVar is still set here, in the request's own context,
+        so that it is copied into every one of those calls.
+        """
         try:
             if _disabled:
                 self.skipped = True
@@ -312,23 +319,30 @@ class Recorder:
                 self.skipped = True
                 return self
             self.activate()
-            self.install()
+            if install:
+                self.install()
         except Exception:
             _disable()
             self.skipped = True
         return self
 
-    def stop(self) -> int:
-        """Uninstall, deactivate, and write the buffer. Never raises."""
+    def finish(self) -> int:
+        """Uninstall and write the buffer -- the blocking half of stop().
+
+        Separate from deactivate() because under ASGI this half belongs in the
+        executor thread and the other half belongs in the request's context.
+        """
         try:
             self.uninstall()
         except Exception:
             _disable()
-        try:
-            self.deactivate()
-        except Exception:
-            _disable()
         return self.flush()
+
+    def stop(self) -> int:
+        """Uninstall, write the buffer, and deactivate. Never raises."""
+        written = self.finish()
+        self.deactivate()
+        return written
 
     def activate(self) -> None:
         if not self.active:
@@ -336,17 +350,21 @@ class Recorder:
             self.active = True
 
     def deactivate(self) -> None:
+        """Never raises: this runs in a `finally` in somebody's request path."""
         if not self.active:
             return
         self.active = False
         token, self._token = self._token, None
-        if token is not None:
-            try:
+        try:
+            if token is not None:
                 _active.reset(token)
-            except ValueError:
-                # Set in one context and reset in another (an executor thread
-                # that outlived its task). Clearing is the honest fallback.
+        except Exception:
+            # Set in one context and reset in another (an executor thread that
+            # outlived its task). Clearing is the honest fallback.
+            try:
                 _active.set(None)
+            except Exception:
+                _disable()
 
     def install(self) -> None:
         """Add the wrapper to this thread's connections.
