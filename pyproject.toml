@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "django-fk-optimize"
+version = "0.1.0"
+description = "Measure what select_related() and prefetch_related() would actually save on your models, instead of guessing."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "oktayelb", email = "oktayelb@gmail.com" }]
+keywords = ["django", "orm", "queryset", "n+1", "select_related", "prefetch_related", "performance"]
+dependencies = ["Django>=4.2"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Framework :: Django",
+    "Framework :: Django :: 4.2",
+    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.1",
+    "Framework :: Django :: 5.2",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.5", "build>=1.0", "twine>=5.0"]
+
+[project.urls]
+Homepage = "https://github.com/oktayelb/django-fk-optimize"
+Repository = "https://github.com/oktayelb/django-fk-optimize"
+Issues = "https://github.com/oktayelb/django-fk-optimize/issues"
+Changelog = "https://github.com/oktayelb/django-fk-optimize/blob/main/CHANGELOG.md"
+
+# Ruff is configured in ruff.toml, which pre-commit also reads. One source only.
+
+[tool.setuptools.packages.find]
+include = ["django_fk_optimize*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
