@@ -1,12 +1,16 @@
 import time
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import Enum
+from statistics import median
 
 from django.apps.registry import apps
 from django.core.exceptions import ObjectDoesNotExist
 from django.core.management.base import BaseCommand, CommandError
+from django.db import DEFAULT_DB_ALIAS, connections, router
 from django.db.models import Model
 from django.db.models.fields.reverse_related import ForeignObjectRel
+from django.test.utils import CaptureQueriesContext
 
 
 class FieldOperation(str, Enum):
@@ -27,6 +31,7 @@ ALL_STRATEGIES = (
 NO_JOIN_STRATEGIES = (FieldOperation.VANILLA, FieldOperation.PREFETCH_RELATED)
 
 DEFAULT_SAMPLE_SIZE = 500
+DEFAULT_REPEAT = 5
 
 FORWARD = "forward"
 REVERSE = "reverse"
@@ -102,6 +107,29 @@ def plan_for(field) -> RelationPlan | None:
     return None
 
 
+@dataclass(frozen=True)
+class Measurement:
+    """What one strategy cost.
+
+    `queries` is the number a reviewer actually acts on: it is deterministic,
+    it does not move with machine load, and "21 queries became 1" is a claim
+    that survives being read on a different machine. `seconds` is the median
+    of several runs and is still only an indication.
+    """
+
+    seconds: float
+    queries: int
+
+
+@dataclass
+class RelationResult:
+    plan: RelationPlan
+    winner: FieldOperation
+    measurements: dict[FieldOperation, Measurement] = dataclass_field(
+        default_factory=dict
+    )
+
+
 class Deadline:
     """A real wall-clock budget for the whole run.
 
@@ -137,10 +165,24 @@ def plans_for(model: type[Model]) -> list[RelationPlan]:
     return plans
 
 
+def format_measurement(measurement: Measurement | None, width: int = 22) -> str:
+    if measurement is None:
+        return "n/a".rjust(width)
+    return f"{measurement.seconds:.6f}s {measurement.queries:>4}q".rjust(width)
+
+
+def describe_measurement(measurement: Measurement | None) -> str:
+    if measurement is None:
+        return "not measured"
+    plural = "query" if measurement.queries == 1 else "queries"
+    return f"{measurement.seconds:.6f}s in {measurement.queries} {plural}"
+
+
 class Command(BaseCommand):
     help = "Queryset optimizer tool for models containing foreign keys."
 
     sample_size = DEFAULT_SAMPLE_SIZE
+    repeat = DEFAULT_REPEAT
 
     def add_arguments(self, parser):
         parser.add_argument("app.model", nargs="?", type=str, default=None)
@@ -163,6 +205,15 @@ class Command(BaseCommand):
             ),
         )
         parser.add_argument(
+            "--repeat",
+            type=int,
+            default=DEFAULT_REPEAT,
+            help=(
+                "timed runs per strategy after a discarded warmup; the median "
+                f"is reported. Default: {DEFAULT_REPEAT}."
+            ),
+        )
+        parser.add_argument(
             "--django-models",
             action="store_true",
             help="when set includes django (and third party) models",
@@ -170,37 +221,30 @@ class Command(BaseCommand):
 
     def _optimize_qs(
         self, model: type[Model], deadline: Deadline
-    ) -> tuple[
-        list[tuple[RelationPlan, FieldOperation, float, float | None, float]],
-        dict[str, float],
-    ]:
+    ) -> tuple[list[RelationResult], dict[str, Measurement]]:
         prefetch_names: list[str] = []
         select_names: list[str] = []
-        per_field_time_metrics: list[
-            tuple[RelationPlan, FieldOperation, float, float | None, float]
-        ] = []
+        results: list[RelationResult] = []
 
-        plans = plans_for(model)
         measured: list[RelationPlan] = []
-        for plan in plans:
+        for plan in plans_for(model):
             if deadline.expired():
                 break
             measured.append(plan)
-            field_results = self._optimize_relation(model, plan)
-            per_field_time_metrics.append((plan, *field_results))
-            winner = field_results[0]
-            if winner == FieldOperation.PREFETCH_RELATED:
+            result = self._optimize_relation(model, plan)
+            results.append(result)
+            if result.winner == FieldOperation.PREFETCH_RELATED:
                 prefetch_names.append(plan.name)
-            elif winner == FieldOperation.SELECT_RELATED:
+            elif result.winner == FieldOperation.SELECT_RELATED:
                 select_names.append(plan.name)
 
-        final_times: dict[str, float] = {}
+        combined: dict[str, Measurement] = {}
         if not deadline.expired():
-            final_times["no_optimization_time"] = self._time_qs(model, measured)
-            final_times["suggested_optimization_time"] = self._time_qs(
+            combined["no_optimization"] = self._measure(model, measured)
+            combined["suggested_optimization"] = self._measure(
                 model, measured, select=select_names, prefetch=prefetch_names
             )
-        return per_field_time_metrics, final_times
+        return results, combined
 
     # -- measurement ---------------------------------------------------
 
@@ -220,23 +264,17 @@ class Command(BaseCommand):
             for _related in value.all():
                 pass
 
-    def _warmup_cache(
-        self, model: type[Model], plans: list[RelationPlan], count: int = 3
-    ) -> None:
-        for _attempt in range(count):
-            self._time_qs(model, plans)
-
-    def _time_qs(
+    def _run_once(
         self,
         model: type[Model],
         plans: list[RelationPlan],
-        *,
-        select: list[str] | None = None,
-        prefetch: list[str] | None = None,
+        select: list[str] | None,
+        prefetch: list[str] | None,
     ) -> float:
+        # A fresh queryset per run: a queryset caches its rows after the first
+        # evaluation, so reusing one would time an in-memory list.
         # Ordered by pk so every strategy reads the same rows, and sliced so
-        # a timing never drags a whole table through memory -- the old code
-        # walked Model.objects.all() three times per relation.
+        # a timing never drags a whole table through memory.
         qs = model.objects.all().order_by("pk")
         if select:
             qs = qs.select_related(*select)
@@ -250,47 +288,59 @@ class Command(BaseCommand):
                 self._touch(row, plan)
         return time.perf_counter() - start_time
 
+    def _measure(
+        self,
+        model: type[Model],
+        plans: list[RelationPlan],
+        *,
+        select: list[str] | None = None,
+        prefetch: list[str] | None = None,
+    ) -> Measurement:
+        """Median of --repeat runs, after one warmup run that is discarded.
+
+        The warmup doubles as the query count: it runs under a debug cursor,
+        which is too slow to time but counts exactly.
+        """
+        connection = connections[router.db_for_read(model) or DEFAULT_DB_ALIAS]
+        with CaptureQueriesContext(connection) as captured:
+            self._run_once(model, plans, select, prefetch)
+        queries = len(captured.captured_queries)
+
+        durations = [
+            self._run_once(model, plans, select, prefetch)
+            for _attempt in range(self.repeat)
+        ]
+        return Measurement(seconds=median(durations), queries=queries)
+
     def _optimize_relation(
         self, model: type[Model], plan: RelationPlan
-    ) -> tuple[FieldOperation, float, float | None, float]:
-        self._warmup_cache(model, [plan])
-
-        vanilla_time = self._time_qs(model, [plan])
-        select_related_time = (
-            self._time_qs(model, [plan], select=[plan.name])
-            if plan.can_select_related
-            else None
-        )
-        prefetch_related_time = self._time_qs(model, [plan], prefetch=[plan.name])
-
-        timings = {
-            FieldOperation.VANILLA: vanilla_time,
-            FieldOperation.PREFETCH_RELATED: prefetch_related_time,
+    ) -> RelationResult:
+        measurements = {
+            FieldOperation.VANILLA: self._measure(model, [plan]),
+            FieldOperation.PREFETCH_RELATED: self._measure(
+                model, [plan], prefetch=[plan.name]
+            ),
         }
-        if select_related_time is not None:
-            timings[FieldOperation.SELECT_RELATED] = select_related_time
+        if plan.can_select_related:
+            measurements[FieldOperation.SELECT_RELATED] = self._measure(
+                model, [plan], select=[plan.name]
+            )
 
-        winner = min(timings, key=timings.__getitem__)
-        if timings[winner] >= vanilla_time:
+        vanilla = measurements[FieldOperation.VANILLA].seconds
+        winner = min(measurements, key=lambda op: measurements[op].seconds)
+        if measurements[winner].seconds >= vanilla:
             winner = FieldOperation.VANILLA
 
-        return (winner, vanilla_time, select_related_time, prefetch_related_time)
+        return RelationResult(plan=plan, winner=winner, measurements=measurements)
 
     # -- reporting -----------------------------------------------------
 
     def _print_results(
         self,
         model: type[Model],
-        per_field_time_metrics: list[
-            tuple[RelationPlan, FieldOperation, float, float | None, float]
-        ],
-        final_times: dict[str, float],
+        results: list[RelationResult],
+        combined: dict[str, Measurement],
     ) -> None:
-        def format_time(value: float | None) -> str:
-            if value is None:
-                return "N/A"
-            return f"{value:.6f}s"
-
         self.stdout.write("")
         self.stdout.write(
             self.style.MIGRATE_HEADING(
@@ -298,41 +348,34 @@ class Command(BaseCommand):
             )
         )
 
-        if not per_field_time_metrics:
-            self.stdout.write("No per-field relation timings were collected.")
+        if not results:
+            self.stdout.write("No per-relation timings were collected.")
         else:
-            self.stdout.write("Per-relation timings:")
             self.stdout.write(
-                f"{'#':<4}"
-                f"{'relation':<24}"
-                f"{'kind':<10}"
-                f"{'winner':<18}"
-                f"{FieldOperation.VANILLA.value:>14}"
-                f"{FieldOperation.SELECT_RELATED.value:>18}"
-                f"{FieldOperation.PREFETCH_RELATED.value:>20}"
+                f"Per-relation timings (median of {self.repeat} runs, "
+                f"at most {self.sample_size} rows):"
+            )
+            self.stdout.write(
+                f"{'#':<4}{'relation':<24}{'kind':<9}{'winner':<18}"
+                f"{FieldOperation.VANILLA.value:>22}"
+                f"{FieldOperation.SELECT_RELATED.value:>22}"
+                f"{FieldOperation.PREFETCH_RELATED.value:>22}"
             )
 
-            operation_counts = {
-                FieldOperation.VANILLA: 0,
-                FieldOperation.SELECT_RELATED: 0,
-                FieldOperation.PREFETCH_RELATED: 0,
-            }
-            for index, (
-                plan,
-                winner,
-                vanilla_time,
-                select_related_time,
-                prefetch_related_time,
-            ) in enumerate(per_field_time_metrics, start=1):
-                operation_counts[winner] = operation_counts.get(winner, 0) + 1
+            operation_counts = dict.fromkeys(FieldOperation, 0)
+            for index, result in enumerate(results, start=1):
+                operation_counts[result.winner] += 1
+                cells = "".join(
+                    format_measurement(result.measurements.get(operation))
+                    for operation in (
+                        FieldOperation.VANILLA,
+                        FieldOperation.SELECT_RELATED,
+                        FieldOperation.PREFETCH_RELATED,
+                    )
+                )
                 self.stdout.write(
-                    f"{index:<4}"
-                    f"{plan.accessor:<24}"
-                    f"{plan.kind:<10}"
-                    f"{winner.value:<18}"
-                    f"{format_time(vanilla_time):>14}"
-                    f"{format_time(select_related_time):>18}"
-                    f"{format_time(prefetch_related_time):>20}"
+                    f"{index:<4}{result.plan.accessor:<24}"
+                    f"{result.plan.kind:<9}{result.winner.value:<18}{cells}"
                 )
 
             self.stdout.write("")
@@ -346,36 +389,32 @@ class Command(BaseCommand):
                 f"{operation_counts[FieldOperation.VANILLA]}"
             )
 
-        no_optimization_time = final_times.get("no_optimization_time")
-        suggested_optimization_time = final_times.get("suggested_optimization_time")
+        vanilla = combined.get("no_optimization")
+        suggested = combined.get("suggested_optimization")
 
         self.stdout.write("")
         self.stdout.write("Combined queryset timings:")
-        self.stdout.write(f"No optimization: {format_time(no_optimization_time)}")
-        self.stdout.write(
-            f"Suggested optimization: {format_time(suggested_optimization_time)}"
-        )
+        self.stdout.write(f"No optimization:        {describe_measurement(vanilla)}")
+        self.stdout.write(f"Suggested optimization: {describe_measurement(suggested)}")
 
-        if no_optimization_time is None or suggested_optimization_time is None:
+        if vanilla is None or suggested is None:
             return
 
-        difference = no_optimization_time - suggested_optimization_time
-        if no_optimization_time:
-            percentage = (difference / no_optimization_time) * 100
-        else:
-            percentage = 0
+        difference = vanilla.seconds - suggested.seconds
+        percentage = (difference / vanilla.seconds * 100) if vanilla.seconds else 0
 
         if difference > 0:
             self.stdout.write(
                 self.style.SUCCESS(
-                    f"Suggested optimization is faster by {format_time(difference)} "
-                    f"({percentage:.2f}%)."
+                    f"Suggested optimization is faster by {difference:.6f}s "
+                    f"({percentage:.2f}%), "
+                    f"{vanilla.queries - suggested.queries} fewer queries."
                 )
             )
         elif difference < 0:
             self.stdout.write(
                 self.style.WARNING(
-                    f"Suggested optimization is slower by {format_time(abs(difference))} "
+                    f"Suggested optimization is slower by {abs(difference):.6f}s "
                     f"({abs(percentage):.2f}%)."
                 )
             )
@@ -411,7 +450,10 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         if options["sample_size"] < 1:
             raise CommandError("--sample-size must be at least 1")
+        if options["repeat"] < 1:
+            raise CommandError("--repeat must be at least 1")
         self.sample_size = options["sample_size"]
+        self.repeat = options["repeat"]
 
         model_s = self._select_models(options["app.model"], options["django_models"])
 
@@ -426,8 +468,8 @@ class Command(BaseCommand):
         for mdl in model_s:
             if deadline.expired():
                 break
-            per_field_time_metrics, final_times = self._optimize_qs(mdl, deadline)
-            self._print_results(mdl, per_field_time_metrics, final_times)
+            results, combined = self._optimize_qs(mdl, deadline)
+            self._print_results(mdl, results, combined)
 
         if deadline.hit:
             self.stdout.write("")
