@@ -159,6 +159,12 @@ class CallSite:
     hints: Hints = Hints()
     touched: tuple[str, ...] = ()
     id_only: tuple[str, ...] = ()
+    # A related manager read but never consumed: free, and prefetching it
+    # would cost an extra query for nothing.
+    free: tuple[str, ...] = ()
+    # A related manager consumed through .filter()/.first()/..., which
+    # re-queries per row even when the relation has been prefetched.
+    bypassed: tuple[str, ...] = ()
     bound: int | None = None
     bound_reason: str = ""
     escapes: bool = False
@@ -190,7 +196,11 @@ class CallSite:
         if self.escapes or self.hints.opaque:
             return ()
         hinted = tuple(self.hints.select) + tuple(self.hints.prefetch)
-        return tuple(name for name in hinted if name not in self.touched)
+        return tuple(
+            name
+            for name in hinted
+            if name not in self.touched and name not in self.bypassed
+        )
 
 
 @dataclass
@@ -289,8 +299,13 @@ class _Scanner:
             self._statement(node, scope, instances, scope_info)
 
         for name, (binding, origin) in instances.items():
-            touched, id_only, escapes = _touches(body, name, binding.model)
-            if not touched and not escapes:
+            reached = _touches(body, name, binding.model)
+            touched, id_only, escapes = (
+                reached.touched,
+                reached.id_only,
+                reached.escapes,
+            )
+            if not (touched or reached.free or reached.bypassed) and not escapes:
                 continue
             self.sites.append(
                 CallSite(
@@ -302,6 +317,8 @@ class _Scanner:
                     hints=binding.hints,
                     touched=touched,
                     id_only=id_only,
+                    free=reached.free,
+                    bypassed=reached.bypassed,
                     bound=binding.bound if binding.bound is not None else 1,
                     bound_reason=binding.bound_reason or "single object",
                     escapes=escapes,
@@ -390,7 +407,12 @@ class _Scanner:
             )
 
     def _record_iteration(self, origin, varname, binding, body, scope_info):
-        touched, id_only, escapes = _touches(body, varname, binding.model)
+        reached = _touches(body, varname, binding.model)
+        touched, id_only, escapes = (
+            reached.touched,
+            reached.id_only,
+            reached.escapes,
+        )
         # `for a in qs:` says nothing about what qs is; the binding remembers.
         expression = _source(origin)
         if isinstance(origin, ast.Name) and binding.origin:
@@ -410,6 +432,8 @@ class _Scanner:
                 hints=binding.hints,
                 touched=touched,
                 id_only=id_only,
+                free=reached.free,
+                bypassed=reached.bypassed,
                 bound=binding.bound,
                 bound_reason=binding.bound_reason,
                 escapes=escapes,
@@ -571,25 +595,102 @@ def _subscript_bound(node):
     return None, False
 
 
-def _touches(nodes, varname, info):
+# What a related manager answers without going back to the database once the
+# queryset has been prefetched.  Measured, not assumed (Django 6.0.4, three
+# publishers with nine books between them):
+#
+#     bare `publisher.book_set`   1 query  ->  2 with prefetch_related
+#     .all() / iteration / len()  4        ->  2
+#     .count() / .exists()        4        ->  2
+#     .filter(...)                4        ->  5
+#     .first()                    4        ->  5
+#
+# So reading the attribute is free and prefetching it is a pessimisation,
+# while .filter() and .first() re-query per row *and* pay for the prefetch on
+# top.  Recommending a hint for either would make the code slower.
+PREFETCH_SERVED = frozenset({"all", "count", "exists", "len"})
+
+
+def _manager_chain(node, parents):
+    """The methods applied to a manager attribute, outermost last.
+
+    `book.tags` -> [], `book.tags.all()` -> ["all"],
+    `book.tags.all().filter(...)` -> ["all", "filter"].
+    """
+    chain: list[str] = []
+    current = node
+    while True:
+        parent = parents.get(id(current))
+        if isinstance(parent, ast.Attribute) and parent.value is current:
+            chain.append(parent.attr)
+            current = parent
+        elif isinstance(parent, ast.Call) and parent.func is current:
+            current = parent
+        else:
+            return chain
+
+
+def _parents(nodes):
+    found = {}
+    for node in nodes:
+        for parent in ast.walk(node):
+            for child in ast.iter_child_nodes(parent):
+                found[id(child)] = parent
+    return found
+
+
+@dataclass(frozen=True)
+class Touches:
+    """Every way a call site reaches a relation, kept apart by what it costs."""
+
+    touched: tuple[str, ...] = ()  # costs a query, and a hint would fix it
+    id_only: tuple[str, ...] = ()  # alarm.type_id: already on the row
+    free: tuple[str, ...] = ()  # the manager itself, never consumed
+    bypassed: tuple[str, ...] = ()  # consumed in a way prefetch cannot serve
+    escapes: bool = False
+
+
+def _touches(nodes, varname, info) -> Touches:
     """Relations of `info` reached through `varname` anywhere in `nodes`."""
-    touched, id_only, escapes = [], [], False
+    touched, id_only, free, bypassed = [], [], [], []
+    escapes = False
+    parents = _parents(nodes)
+
     for node in nodes:
         for sub in ast.walk(node):
             if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name):
                 if sub.value.id != varname:
                     continue
-                if info.relation(sub.attr) is not None:
+                relation = info.relation(sub.attr)
+                if relation is None:
+                    if sub.attr in info.attnames:
+                        # alarm.type_id is already in the row. Recorded so the
+                        # report can say "you are fine" rather than say nothing.
+                        id_only.append(sub.attr)
+                    continue
+                if not getattr(relation, "manager", False):
                     touched.append(sub.attr)
-                elif sub.attr in info.attnames:
-                    # alarm.type_id is already in the row. Recorded so the
-                    # report can say "you are fine" rather than say nothing.
-                    id_only.append(sub.attr)
+                    continue
+                chain = _manager_chain(sub, parents)
+                if not chain:
+                    free.append(sub.attr)
+                elif all(method in PREFETCH_SERVED for method in chain):
+                    touched.append(sub.attr)
+                else:
+                    bypassed.append(sub.attr)
             elif isinstance(sub, ast.Call):
                 for arg in list(sub.args) + [kw.value for kw in sub.keywords]:
                     if isinstance(arg, ast.Name) and arg.id == varname:
                         escapes = True
-    return tuple(dict.fromkeys(touched)), tuple(dict.fromkeys(id_only)), escapes
+
+    unique = dict.fromkeys
+    return Touches(
+        touched=tuple(unique(touched)),
+        id_only=tuple(unique(id_only)),
+        free=tuple(name for name in unique(free) if name not in touched),
+        bypassed=tuple(name for name in unique(bypassed) if name not in touched),
+        escapes=escapes,
+    )
 
 
 def _child_statements(node):

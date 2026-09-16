@@ -1,32 +1,67 @@
 from django_fk_optimize.utils import ModelInfo, Relation, Vocabulary
+from django_fk_optimize.utils import vocabulary as vocabulary_module
 from django_fk_optimize.utils.vocabulary import _describe
 
 
-def test_describe_records_forward_many_to_one_only():
+def test_describe_records_forward_relations_with_their_column():
     from tests.testapp.models import Book
 
     info = _describe(Book)
 
-    assert set(info.relations) == {"publisher", "author"}
+    assert info.forward_relations.keys() >= {"publisher", "author"}
     assert info.relations["author"].null is True
     assert info.relations["publisher"].null is False
     assert info.relations["publisher"].attname == "publisher_id"
     assert info.relations["publisher"].target == "testapp.Publisher"
+    assert info.relations["publisher"].kind == vocabulary_module.FORWARD
+    assert info.relations["publisher"].joinable is True
+    assert info.relations["publisher"].manager is False
 
 
-def test_describe_excludes_m2m_and_reverse_but_lists_them():
-    from tests.testapp.models import Book, Publisher
+def test_describe_records_many_to_many_as_a_manager():
+    from tests.testapp.models import Book
 
-    book = _describe(Book)
-    publisher = _describe(Publisher)
+    info = _describe(Book)
 
-    # tags is many-to-many: named, but not optimizable as a forward FK.
-    assert "tags" not in book.relations
-    assert "tags" in book.all_relation_names
+    assert "tags" in info.relations
+    assert "tags" in info.all_relation_names
+    assert info.relations["tags"].kind == vocabulary_module.MANY_TO_MANY
+    assert info.relations["tags"].manager is True
+    assert info.relations["tags"].joinable is False, (
+        "select_related() raises FieldError on a many-to-many"
+    )
+    assert info.relations["tags"].attname == "", "there is no column to read"
 
-    # Publisher's relations are all reverse, so it has nothing to optimize.
-    assert publisher.relations == {}
-    assert "book" in publisher.all_relation_names
+
+def test_describe_keys_a_reverse_relation_by_its_accessor():
+    """`book_set`, not `book`.
+
+    The related_query_name goes in a filter; the accessor is what an instance
+    answers to. Using one where the other belongs is the AttributeError this
+    project started from.
+    """
+    from tests.testapp.models import Publisher
+
+    info = _describe(Publisher)
+
+    assert "book_set" in info.relations
+    assert "book" not in info.relations
+    assert info.relations["book_set"].kind == vocabulary_module.REVERSE
+    assert info.relations["book_set"].manager is True
+    assert info.relations["book_set"].target == "testapp.Book"
+
+
+def test_describe_marks_a_reverse_one_to_one_as_joinable():
+    """The one reverse relation Django can carry in the parent row."""
+    from tests.testapp.models import Author
+
+    info = _describe(Author)
+
+    assert info.relations["profile"].kind == vocabulary_module.REVERSE_ONE_TO_ONE
+    assert info.relations["profile"].joinable is True
+    assert info.relations["profile"].manager is False, (
+        "a reverse one-to-one hands back an instance, not a manager"
+    )
 
 
 def test_describe_excludes_parent_link():
@@ -102,6 +137,8 @@ def test_from_apps_covers_the_test_app():
     vocabulary = Vocabulary.from_apps()
 
     assert "testapp.Book" in vocabulary
-    assert set(vocabulary.models["testapp.Book"].relations) == {"publisher", "author"}
+    book = vocabulary.models["testapp.Book"]
+    assert set(book.forward_relations) >= {"publisher", "author"}
+    assert "tags" in book.relations, "manager relations are covered now too"
     # django.* apps are excluded by default.
     assert "contenttypes.ContentType" not in vocabulary

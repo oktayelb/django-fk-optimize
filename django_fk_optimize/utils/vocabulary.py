@@ -15,21 +15,50 @@ from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 
+# How a relation behaves when a row touches it.  The distinction is not
+# cosmetic: it decides which hint is legal, which is useful, and -- for the
+# two manager kinds -- whether reading the attribute costs anything at all.
+FORWARD = "forward"  # alarm.type      -> an instance, one query, joinable
+REVERSE_ONE_TO_ONE = (
+    "reverse1to1"  # author.profile  -> an instance, one query, joinable
+)
+REVERSE = "reverse"  # publisher.book_set -> a manager
+MANY_TO_MANY = "m2m"  # book.tags       -> a manager
+
+MANAGER_KINDS = frozenset({REVERSE, MANY_TO_MANY})
+JOINABLE_KINDS = frozenset({FORWARD, REVERSE_ONE_TO_ONE})
+
 
 @dataclass(frozen=True)
 class Relation:
-    """A forward many-to-one -- the only relation kind this project optimizes.
+    """One relation, as the code that touches it sees it.
 
-    `name` is what a call site touches and what select_related() takes.
-    `attname` is the column attribute, and touching *that* is not a touch at
-    all: `alarm.type_id` is already loaded and costs no query, while
-    `alarm.type` and even `alarm.type.pk` go back to the database.
+    `name` is the accessor: what a call site writes, and what the hint takes.
+    `attname` is the column attribute and exists only on a forward relation;
+    touching *that* is not a touch at all, since `alarm.type_id` is already
+    loaded while `alarm.type` goes back to the database.
+
+    `kind` decides everything downstream.  A forward many-to-one can be joined
+    and is one query per row when it is not; a reverse many-to-one or a
+    many-to-many hands back a *manager*, which is free to read and only costs
+    something once it is consumed.
     """
 
     name: str
     attname: str
     target: str
     null: bool = False
+    kind: str = FORWARD
+
+    @property
+    def manager(self) -> bool:
+        """Whether the accessor returns a manager rather than an instance."""
+        return self.kind in MANAGER_KINDS
+
+    @property
+    def joinable(self) -> bool:
+        """Whether select_related() is legal on it."""
+        return self.kind in JOINABLE_KINDS
 
 
 @dataclass
@@ -51,7 +80,15 @@ class ModelInfo:
 
     @property
     def attnames(self) -> frozenset[str]:
-        return frozenset(rel.attname for rel in self.relations.values())
+        return frozenset(rel.attname for rel in self.relations.values() if rel.attname)
+
+    @property
+    def forward_relations(self) -> dict[str, Relation]:
+        """Only the forward many-to-one relations, for callers that still
+        mean that and nothing else."""
+        return {
+            name: rel for name, rel in self.relations.items() if rel.kind == FORWARD
+        }
 
     def relation(self, attr: str) -> Relation | None:
         return self.relations.get(attr)
@@ -113,6 +150,64 @@ class Vocabulary:
         return len(self.models)
 
 
+def _relation(field, ForeignObjectRel) -> Relation | None:
+    """One `_meta.get_fields()` entry as a Relation, or None to ignore it.
+
+    The accessor is the key throughout: it is what the call site writes and
+    what the hint takes.  For a reverse relation that is `get_accessor_name()`
+    ("book_set"), never `.name`, which is the related_query_name ("book") and
+    belongs in a filter rather than on an instance.  Conflating the two is the
+    original bug this project was built around.
+
+    None means there is nothing here a hint could help: a hidden reverse
+    relation has no accessor, a parent link is joined by inheritance whatever
+    we do, and a GenericForeignKey has no single related model to point at.
+    """
+    related = getattr(field, "related_model", None)
+    if related is None:
+        return None
+
+    if isinstance(field, ForeignObjectRel):
+        if field.hidden:
+            return None
+        accessor = field.get_accessor_name()
+        if not accessor:
+            return None
+        if field.many_to_many:
+            kind = MANY_TO_MANY
+        elif field.one_to_one:
+            kind = REVERSE_ONE_TO_ONE
+        else:
+            kind = REVERSE
+        return Relation(
+            name=accessor,
+            attname="",
+            target=related._meta.label,
+            null=True,  # there may simply be nothing on the other side
+            kind=kind,
+        )
+
+    if field.many_to_many:
+        return Relation(
+            name=field.name,
+            attname="",
+            target=related._meta.label,
+            null=True,
+            kind=MANY_TO_MANY,
+        )
+    if getattr(field.remote_field, "parent_link", False):
+        return None
+    if field.many_to_one or field.one_to_one:
+        return Relation(
+            name=field.name,
+            attname=field.attname,
+            target=related._meta.label,
+            null=bool(field.null),
+            kind=FORWARD,
+        )
+    return None
+
+
 def _describe(model) -> ModelInfo:
     from django.db.models.fields.reverse_related import ForeignObjectRel
 
@@ -126,22 +221,9 @@ def _describe(model) -> ModelInfo:
         if name:
             all_relations.add(name)
 
-        # The same test m2o_optimize uses, for the same reason: many_to_one is
-        # true only on the forward side, which rules out reverse relations, m2m
-        # and one-to-one in one go.
-        if not field.many_to_one or field.related_model is None:
-            continue
-        if isinstance(field, ForeignObjectRel):
-            continue
-        if getattr(field.remote_field, "parent_link", False):
-            continue
-
-        relations[field.name] = Relation(
-            name=field.name,
-            attname=field.attname,
-            target=field.related_model._meta.label,
-            null=bool(field.null),
-        )
+        described = _relation(field, ForeignObjectRel)
+        if described is not None:
+            relations[described.name] = described
 
     return ModelInfo(
         label=model._meta.label,

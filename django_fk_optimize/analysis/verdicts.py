@@ -75,6 +75,12 @@ SWITCH_TO_SELECT = "switch_to_select_related"
 KEEP_PREFETCH = "keep_prefetch"
 ALREADY_HINTED = "already_hinted"
 ID_ONLY = "id_only"
+# A related manager read but never consumed. Free already, and prefetching it
+# would add a query rather than remove one.
+FREE_MANAGER = "free_manager"
+# A related manager consumed through .filter()/.first()/..., which re-queries
+# per row even when the relation is prefetched.
+PREFETCH_BYPASSED = "prefetch_bypassed"
 
 # Verdicts that mean "change this". --fail-on-findings fires on exactly these.
 ACTIONABLE_KINDS = frozenset({N_PLUS_ONE, EXTRA_QUERY, REMOVE_HINT, SWITCH_TO_SELECT})
@@ -708,7 +714,9 @@ def _site_verdicts(site, observed, vocabulary, cardinality, sample_size):
         if info.relation(relation) is None:
             continue
         if relation in missing:
-            out.append(_unhinted(site, relation, observed, cardinality, sample_size))
+            out.append(
+                _unhinted(site, relation, observed, cardinality, sample_size, info)
+            )
         elif relation in site.hints.prefetch:
             out.append(_prefetched(site, relation, observed, cardinality, sample_size))
         else:
@@ -718,7 +726,12 @@ def _site_verdicts(site, observed, vocabulary, cardinality, sample_size):
                 relation,
                 _rows(site, relation, observed, cardinality, sample_size),
             )
-            verdict.headline = f'already covered by select_related("{relation}")'
+            method = (
+                FieldOperation.PREFETCH_RELATED.value
+                if _prefetch_only(info, relation)
+                else FieldOperation.SELECT_RELATED.value
+            )
+            verdict.headline = f'already covered by {method}("{relation}")'
             out.append(verdict)
 
     for relation in site.unused:
@@ -739,6 +752,34 @@ def _site_verdicts(site, observed, vocabulary, cardinality, sample_size):
         _soften(verdict, site)
         out.append(verdict)
 
+    for relation in site.free:
+        verdict = _base(site, FREE_MANAGER, relation, Rows(0, UNKNOWN))
+        verdict.headline = (
+            f"{relation} is read but never consumed; a related manager costs "
+            "nothing until something evaluates it"
+        )
+        verdict.notes = verdict.notes + (
+            f'prefetch_related("{relation}") here would add a query, not remove one',
+        )
+        out.append(verdict)
+
+    for relation in site.bypassed:
+        verdict = _base(site, PREFETCH_BYPASSED, relation, Rows(0, UNKNOWN))
+        hinted = relation in site.hints.prefetch
+        verdict.headline = (
+            f"{relation} is consumed in a way prefetch_related cannot serve"
+        )
+        verdict.notes = verdict.notes + (
+            "filter(), first() and the rest re-query per row even when the "
+            "relation is prefetched; only all(), count() and exists() read "
+            "the cache",
+        )
+        if hinted:
+            verdict.notes = verdict.notes + (
+                f'prefetch_related("{relation}") is paid for here and not used',
+            )
+        out.append(verdict)
+
     for attname in site.id_only:
         relation = next(
             (rel.name for rel in info.relations.values() if rel.attname == attname),
@@ -753,7 +794,18 @@ def _site_verdicts(site, observed, vocabulary, cardinality, sample_size):
     return out
 
 
-def _unhinted(site, relation, observed, cardinality, sample_size) -> Verdict:
+def _prefetch_only(info, relation: str) -> bool:
+    """Whether a hint for this relation has to be prefetch_related().
+
+    Read off the relation kind rather than guessed: select_related() raises
+    FieldError on a reverse many-to-one and on a many-to-many, and the one
+    reverse relation Django *can* join is a one-to-one.
+    """
+    described = info.relation(relation) if info is not None else None
+    return bool(described is not None and described.manager)
+
+
+def _unhinted(site, relation, observed, cardinality, sample_size, info=None) -> Verdict:
     rows = _rows(site, relation, observed, cardinality, sample_size)
     match = observed.get((id(site), relation))
     kind = N_PLUS_ONE if rows.n > 1 else EXTRA_QUERY
@@ -768,12 +820,17 @@ def _unhinted(site, relation, observed, cardinality, sample_size) -> Verdict:
             verdict.notes = verdict.notes + (
                 "matched on the enclosing scope only; the table did not confirm it",
             )
+    prefetch = _prefetch_only(info, relation)
     verdict.headline = (
         f"{rows.n} extra queries, one per row"
         if kind == N_PLUS_ONE
-        else "one extra query, and a join would carry it for free"
+        else (
+            "one extra query, and a batch would carry it"
+            if prefetch
+            else "one extra query, and a join would carry it for free"
+        )
     )
-    fit(verdict)
+    fit(verdict, prefetch=prefetch)
     _soften(verdict, site)
     return verdict
 

@@ -446,15 +446,140 @@ def tagged():
 """
 
 
-def test_a_prefetch_the_scanner_cannot_see_a_touch_for_is_left_alone(
-    vocabulary, tables
-):
-    """`touched` holds forward FKs only, so an m2m hint always looks unused."""
+def test_a_correct_m2m_prefetch_is_recognised_not_flagged(vocabulary, tables):
+    """This used to report nothing at all, because touches were forward-only.
+
+    A many-to-many hint therefore always looked unused, and the guard that
+    stopped it being reported also stopped it being understood.
+    """
     sites = sites_for(M2M_HINT, vocabulary)
+    site = site_at(sites, "tagged")
+    assert "tags" in site.touched
+    assert site.unused == (), "a hint that is used must never be called unused"
 
-    verdicts, _ = V.build(sites, [], vocabulary, tables)
+    verdicts, _ = V.build(sites, [], vocabulary, tables, cardinality=counts())
 
-    assert [verdict.kind for verdict in verdicts] == []
+    assert [verdict.kind for verdict in verdicts] == [V.KEEP_PREFETCH]
+    assert all(not verdict.actionable for verdict in verdicts)
+
+
+M2M_UNHINTED = """
+from tests.testapp.models import Book
+
+
+def tagged():
+    for book in Book.objects.all():
+        send(book.tags.all())
+"""
+
+
+def test_an_unhinted_m2m_is_offered_prefetch_never_a_join(vocabulary, tables):
+    sites = sites_for(M2M_UNHINTED, vocabulary)
+
+    verdicts, _ = V.build(sites, [], vocabulary, tables, cardinality=counts())
+    finding = only(verdicts, V.N_PLUS_ONE)
+
+    assert finding.actionable is True
+    assert 'prefetch_related("tags")' in finding.fix
+    assert "select_related" not in finding.fix, (
+        "select_related() raises FieldError on a many-to-many"
+    )
+
+
+REVERSE_UNHINTED = """
+from tests.testapp.models import Publisher
+
+
+def listing():
+    for publisher in Publisher.objects.all():
+        send(list(publisher.book_set.all()))
+"""
+
+
+def test_an_unhinted_reverse_fk_is_seen_and_offered_prefetch(vocabulary, tables):
+    """The relations where prefetching matters most used to be invisible."""
+    sites = sites_for(REVERSE_UNHINTED, vocabulary)
+    assert "book_set" in site_at(sites, "listing").touched
+
+    verdicts, _ = V.build(sites, [], vocabulary, tables, cardinality=counts())
+    finding = only(verdicts, V.N_PLUS_ONE)
+
+    assert 'prefetch_related("book_set")' in finding.fix
+    assert "select_related" not in finding.fix
+
+
+REVERSE_ONE_TO_ONE = """
+from tests.testapp.models import Author
+
+
+def bios():
+    for author in Author.objects.all():
+        send(author.profile.bio)
+"""
+
+
+def test_a_reverse_one_to_one_is_offered_a_join(vocabulary, tables):
+    """The one reverse relation Django can carry in the parent row."""
+    sites = sites_for(REVERSE_ONE_TO_ONE, vocabulary)
+
+    verdicts, _ = V.build(sites, [], vocabulary, tables, cardinality=counts())
+    finding = only(verdicts, V.N_PLUS_ONE)
+
+    assert 'select_related("profile")' in finding.fix
+
+
+M2M_BARE = """
+from tests.testapp.models import Book
+
+
+def tagged():
+    for book in Book.objects.all():
+        register(book.tags)
+"""
+
+
+def test_reading_a_manager_without_consuming_it_is_free(vocabulary, tables):
+    """Measured: bare access is 1 query, and prefetching it makes that 2."""
+    sites = sites_for(M2M_BARE, vocabulary)
+    site = site_at(sites, "tagged")
+    assert site.free == ("tags",)
+    assert site.touched == ()
+
+    verdicts, _ = V.build(sites, [], vocabulary, tables, cardinality=counts())
+    verdict = only(verdicts, V.FREE_MANAGER)
+
+    assert verdict.actionable is False
+    assert any("add a query, not remove one" in note for note in verdict.notes)
+
+
+M2M_FILTERED = """
+from tests.testapp.models import Book
+
+
+def tagged():
+    books = Book.objects.prefetch_related("tags")
+    for book in books:
+        send(book.tags.filter(name="x"))
+"""
+
+
+def test_a_manager_consumed_by_filter_is_not_served_by_prefetch(vocabulary, tables):
+    """Measured: .filter() re-queries per row *and* pays for the prefetch.
+
+    Reporting this as a satisfied hint would have been wrong, and reporting
+    it as an unused hint would have been wrong in the other direction.
+    """
+    sites = sites_for(M2M_FILTERED, vocabulary)
+    site = site_at(sites, "tagged")
+    assert site.bypassed == ("tags",)
+    assert site.touched == ()
+    assert site.unused == (), "it is used -- just not in a way the hint serves"
+
+    verdicts, _ = V.build(sites, [], vocabulary, tables, cardinality=counts())
+    verdict = only(verdicts, V.PREFETCH_BYPASSED)
+
+    assert any("re-query per row" in note for note in verdict.notes)
+    assert any("paid for here and not used" in note for note in verdict.notes)
 
 
 PREFETCHED = """
