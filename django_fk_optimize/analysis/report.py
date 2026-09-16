@@ -28,15 +28,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
-from ..utils.callsites import RESOLVED
-from .verdicts import (
-    ACTIONABLE_KINDS,
-    ESTIMATED,
-    ID_ONLY,
-    OBSERVED,
-    REMOVE_HINT,
-    Verdict,
-)
+from .verdicts import ACTIONABLE_KINDS, REMOVE_HINT, Verdict
 
 SCHEMA_VERSION = 1
 
@@ -411,13 +403,9 @@ def dumps(verdicts, coverage: Coverage) -> str:
 
 
 __all__ = [
-    "ESTIMATED",
     "HEADING",
-    "ID_ONLY",
     "NOTICE",
-    "OBSERVED",
     "PLAIN",
-    "RESOLVED",
     "SCHEMA_VERSION",
     "SUCCESS",
     "WARNING",
@@ -425,5 +413,6 @@ __all__ = [
     "dumps",
     "render_json",
     "render_text",
+    "relative",
     "verdict_json",
 ]

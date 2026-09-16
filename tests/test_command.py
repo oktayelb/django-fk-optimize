@@ -551,3 +551,59 @@ def test_a_template_n_plus_one_is_reported_with_no_call_site(library, tmp_path):
     assert 'add .select_related("publisher")' in output
     assert "catalogue()" in output
     assert "1 with no call site" in output
+
+
+def ambiguous_recording(path):
+    """An N+1 on testapp_author with no page query to say whose it was.
+
+    Both Book.author and Author.mentor point there, so nothing can name the
+    relation -- which is a reason to print the candidates, not to say nothing.
+    """
+    import time
+
+    from django_fk_optimize.recording import store
+
+    shape = (
+        'SELECT "testapp_author"."id" FROM "testapp_author" '
+        'WHERE "testapp_author"."id" = ?'
+    )
+    store.append(
+        path,
+        [
+            store.Record(
+                ts=time.time(),
+                shape=shape,
+                shape_hash="lookup",
+                duration=0.001,
+                file="/elsewhere/shop/views.py",
+                line=9,
+                function="people",
+                source="template",
+            )
+            for _ in range(25)
+        ],
+    )
+    return path
+
+
+def test_an_unnameable_runtime_finding_is_still_printed(library, tmp_path):
+    output = report("--recording", str(ambiguous_recording(tmp_path / "r.jsonl")))
+
+    assert "people()" in output
+    assert "25  (observed)" in output
+    assert "testapp.Book.author" in output
+    assert "testapp.Author.mentor" in output
+    assert "confidence: probable" in output
+
+
+def test_an_unnameable_runtime_finding_respects_the_narrowing(library, tmp_path):
+    output = run(
+        "testapp.Tag",
+        "--recording",
+        str(ambiguous_recording(tmp_path / "r.jsonl")),
+        "--repeat",
+        "1",
+    )
+
+    assert "people()" not in output
+    assert "no change worth making" in output

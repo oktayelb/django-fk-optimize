@@ -87,6 +87,22 @@ STYLES = {
 }
 
 
+def _in_scope(verdict, labels) -> bool:
+    """Is this verdict about one of the models the run was narrowed to?
+
+    A runtime-only finding whose relation could not be pinned down has no
+    model to test, only candidates -- and dropping it because of that would
+    throw away exactly the findings the static half could never have made.
+    """
+    if verdict.model:
+        return verdict.model in labels
+    if not verdict.runtime_only:
+        return False
+    return any(
+        candidate.rsplit(".", 1)[0] in labels for candidate in verdict.candidates
+    )
+
+
 class Command(BaseCommand):
     help = (
         "Find the foreign keys your code loads one row at a time, and measure "
@@ -298,11 +314,8 @@ class Command(BaseCommand):
 
         # Every project file is scanned even when the report is narrowed to one
         # model: the call site that iterates it is very often in another app.
-        scan = scan_files(
-            (path for path, _package in discover(include_django)),
-            vocabulary,
-            package_for=dict(discover(include_django)).get,
-        )
+        packages = dict(discover(include_django))
+        scan = scan_files(packages, vocabulary, package_for=packages.get)
         sites = [site for site in scan.sites if site.model in labels]
 
         path = self._recording_path(options)
@@ -326,7 +339,7 @@ class Command(BaseCommand):
         verdicts = [
             verdict
             for verdict in verdicts
-            if verdict.model in labels
+            if _in_scope(verdict, labels)
             and self._big_enough(verdict, cardinality, options["min_rows"])
         ]
 
