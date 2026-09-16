@@ -36,6 +36,8 @@ one relation at a time, instead of guessing from the model definitions.
   it replaced.
 - `.gitignore` no longer ignores itself, and no longer hides every `utils/`
   directory in the tree.
+- The coverage block counts in English. It interpolated numbers straight into
+  plural nouns, so a run that timed one relation reported `1 relations timed`.
 
 ### Added
 
@@ -104,9 +106,25 @@ one relation at a time, instead of guessing from the model definitions.
   scanner — model vocabulary, per-module import resolution, queryset call-site
   detection and source discovery — is now part of the distribution.
 - Packaging metadata (`pyproject.toml`): setuptools backend, Django >= 4.2,
-  Python >= 3.10, MIT, classifiers, project URLs and a `dev` extra.
+  Python >= 3.10, MIT, classifiers through Django 6.0 and Python 3.14, project
+  URLs and a `dev` extra.
 - A test suite that runs under plain `pytest` with no pytest-django, bootstrapping
-  Django in `conftest.py` against in-memory sqlite.
+  Django in `conftest.py` against in-memory sqlite. `FK_OPTIMIZE_TEST_DB=postgres`
+  points the same suite at a real server through the libpq environment
+  variables; the default needs no argument and no database to be running.
+- A GitHub Actions workflow. The suite runs on eight Django/Python pairs from
+  4.2 on 3.10 to 6.0 on 3.14, and once more against a postgres service
+  container, because `COUNT(DISTINCT ...)` and a table name parsed back out of
+  the SQL are not things sqlite alone can prove portable. `build` makes the
+  real wheel and imports it from outside the source tree, where an editable
+  install can no longer cover for a module missing from the distribution.
+- `scripts/smoke.py`: the whole product asserted from outside. It writes a
+  throwaway Django project with a deliberate N+1, records it, runs the command
+  with `--fail-on-findings` and requires exit 1 with the relation named, then
+  applies the fix the report printed and requires exit 0.
+- A README that documents the command that exists rather than the one that was
+  planned: the three-step quickstart, an annotated real report, both modes, the
+  full option reference, the settings block, and what the tool cannot see.
 
 ### Changed
 
