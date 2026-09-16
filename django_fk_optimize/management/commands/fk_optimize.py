@@ -26,6 +26,8 @@ ALL_STRATEGIES = (
 # select_related() raises FieldError on them -- so only two strategies exist.
 NO_JOIN_STRATEGIES = (FieldOperation.VANILLA, FieldOperation.PREFETCH_RELATED)
 
+DEFAULT_SAMPLE_SIZE = 500
+
 FORWARD = "forward"
 REVERSE = "reverse"
 MANY_TO_MANY = "m2m"
@@ -138,6 +140,8 @@ def plans_for(model: type[Model]) -> list[RelationPlan]:
 class Command(BaseCommand):
     help = "Queryset optimizer tool for models containing foreign keys."
 
+    sample_size = DEFAULT_SAMPLE_SIZE
+
     def add_arguments(self, parser):
         parser.add_argument("app.model", nargs="?", type=str, default=None)
         parser.add_argument(
@@ -147,6 +151,15 @@ class Command(BaseCommand):
             help=(
                 "wall-clock budget in seconds for the whole run; partial "
                 "results are still printed. Default: no limit."
+            ),
+        )
+        parser.add_argument(
+            "--sample-size",
+            type=int,
+            default=DEFAULT_SAMPLE_SIZE,
+            help=(
+                "rows per timed queryset. Every strategy reads the same "
+                f"slice, ordered by pk. Default: {DEFAULT_SAMPLE_SIZE}."
             ),
         )
         parser.add_argument(
@@ -221,11 +234,15 @@ class Command(BaseCommand):
         select: list[str] | None = None,
         prefetch: list[str] | None = None,
     ) -> float:
-        qs = model.objects.all()
+        # Ordered by pk so every strategy reads the same rows, and sliced so
+        # a timing never drags a whole table through memory -- the old code
+        # walked Model.objects.all() three times per relation.
+        qs = model.objects.all().order_by("pk")
         if select:
             qs = qs.select_related(*select)
         if prefetch:
             qs = qs.prefetch_related(*prefetch)
+        qs = qs[: self.sample_size]
 
         start_time: float = time.perf_counter()
         for row in qs:
@@ -392,6 +409,10 @@ class Command(BaseCommand):
         return [mdl for mdl in model_s if plans_for(mdl)]
 
     def handle(self, *args, **options):
+        if options["sample_size"] < 1:
+            raise CommandError("--sample-size must be at least 1")
+        self.sample_size = options["sample_size"]
+
         model_s = self._select_models(options["app.model"], options["django_models"])
 
         if not model_s:
