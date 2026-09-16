@@ -253,14 +253,54 @@ def test_a_template_finding_is_reported_even_with_no_call_site(vocabulary, table
 
     assert verdict.runtime_only is True
     assert verdict.source == TEMPLATE
-    assert verdict.relation == "publisher"
-    assert verdict.model == "testapp.Book"
     assert verdict.rows == V.Rows(412, V.OBSERVED)
     assert verdict.function == "book_list"
     assert verdict.file == "/proj/testapp/other.py"
     assert "template" in verdict.headline
+    assert verdict.relation == "publisher"
+    assert verdict.model == "testapp.Book"
     assert 'select_related("publisher")' in verdict.fix
     assert "book_list()" in verdict.fix
+
+
+def test_a_proxy_model_does_not_make_a_nameable_finding_ambiguous(vocabulary, tables):
+    """A proxy repeats its concrete model's relations against the same table.
+
+    Counted naively that turns one candidate into two, and a finding that
+    could be named exactly gets reported as a guess instead.
+    """
+    labels = {
+        info.label
+        for info in vocabulary.models.values()
+        if "publisher" in info.relations
+    }
+    assert {"testapp.Book", "testapp.PopularBook"} <= labels, (
+        "the proxy has to be in the vocabulary for this to prove anything"
+    )
+
+    group = lookup(PUBLISHERS, line=42, count=10, path="/proj/testapp/v.py")
+    page = bulk(BOOKS, path="/proj/testapp/v.py")
+
+    (match,) = V.join([group, page], [], vocabulary, tables).runtime_only
+
+    assert match.named is True
+    assert (match.model, match.relation) == ("testapp.Book", "publisher")
+
+
+def test_a_reverse_relation_is_never_offered_for_a_single_row_lookup(
+    vocabulary, tables
+):
+    """A repeated `WHERE id = ?` on the target table is a forward deref.
+
+    Reverse and m2m access queries the *child* table with the parent's id --
+    a different shape -- so including them would only dilute the candidates.
+    """
+    group = lookup(PUBLISHERS, line=42, count=10, path="/proj/testapp/v.py")
+    page = bulk(BOOKS, path="/proj/testapp/v.py")
+
+    (match,) = V.join([group, page], [], vocabulary, tables).runtime_only
+
+    assert all(name != "book_set" for _label, name in match.candidates)
 
 
 def test_a_serializer_finding_says_so(vocabulary, tables):

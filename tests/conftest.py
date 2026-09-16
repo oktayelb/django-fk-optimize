@@ -114,7 +114,13 @@ def db():
 
 @pytest.fixture
 def library(db):
-    """A small, fixed dataset: 3 publishers, 12 books, 6 authors, 4 tags."""
+    """A small, fixed dataset: 3 publishers, 12 books, 6 authors, 4 tags.
+
+    Deliberately unchanged and deliberately narrow. Several tests assert exact
+    query counts against it, so a row added here breaks them loudly -- which is
+    the point. The exotic model shapes live in `menagerie` instead, so that
+    widening coverage cannot quietly move these numbers.
+    """
     from tests.testapp.models import Author, Book, Profile, Publisher, Tag
 
     publishers = [Publisher.objects.create(name=f"publisher-{i}") for i in range(3)]
@@ -142,4 +148,70 @@ def library(db):
         "tags": tags,
         "authors": authors,
         "books": books,
+    }
+
+
+@pytest.fixture
+def menagerie(library):
+    """`library`, plus a row for every remaining model in the test app.
+
+    Kept apart from `library` because it adds Textbook rows, and a Textbook
+    *is* a Book -- so folding it in would move the query counts that the rest
+    of the suite pins. The generated matrix skips a model it cannot
+    instantiate, and a skipped case is not coverage, so everything gets a row.
+    """
+    from django.contrib.contenttypes.models import ContentType
+
+    from tests.testapp.models import (
+        Book,
+        Club,
+        Imprint,
+        Membership,
+        Note,
+        Review,
+        Series,
+        Textbook,
+    )
+
+    publishers = library["publishers"]
+    authors = library["authors"]
+    books = library["books"]
+
+    imprints = [
+        Imprint.objects.create(code=f"imp-{i}", publisher=publishers[i % 3])
+        for i in range(3)
+    ]
+    for index in range(4):
+        Series.objects.create(name=f"series-{index}", imprint=imprints[index % 3])
+
+    clubs = [Club.objects.create(name=f"club-{i}") for i in range(2)]
+    for index, book in enumerate(books[:6]):
+        Membership.objects.create(book=book, club=clubs[index % 2])
+    clubs[0].affiliates.add(clubs[1])
+
+    for index, book in enumerate(books[:5]):
+        Review.objects.create(book=book, score=index, created_by=authors[index % 6])
+
+    textbooks = [
+        Textbook.objects.create(
+            title=f"textbook-{i}",
+            publisher=publishers[i % 3],
+            author=authors[i % 6],
+            subject=f"subject-{i}",
+        )
+        for i in range(2)
+    ]
+
+    for book in books[:3]:
+        Note.objects.create(
+            content_type=ContentType.objects.get_for_model(Book),
+            object_id=book.pk,
+            body="a note",
+        )
+
+    return {
+        **library,
+        "imprints": imprints,
+        "clubs": clubs,
+        "textbooks": textbooks,
     }

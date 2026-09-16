@@ -96,8 +96,12 @@ def test_hidden_reverse_relation_is_skipped():
     accessors = {plan.accessor for plan in plans_for(Publisher)}
 
     # Author.favourite_publisher uses related_name="+", so Publisher has no
-    # accessor for it at all.
-    assert accessors == {"book_set"}
+    # accessor for it at all. Asserted by absence rather than by an exact set,
+    # so adding a model to the test app cannot make this fail for an unrelated
+    # reason.
+    assert "book_set" in accessors
+    assert not any("author" in accessor for accessor in accessors)
+    assert all(accessor for accessor in accessors), "every plan has an accessor"
 
 
 def test_parent_link_is_skipped():

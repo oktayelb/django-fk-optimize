@@ -41,7 +41,7 @@ from django.db import DatabaseError
 from ..recording.store import BULK, QueryGroup
 from ..recording.wrapper import PYTHON, SERIALIZER, TEMPLATE
 from ..utils.callsites import PROBABLE, RESOLVED, CallSite
-from ..utils.vocabulary import Vocabulary
+from ..utils.vocabulary import FORWARD, Vocabulary
 from .benchmark import (
     DEFAULT_SAMPLE_SIZE,
     MEASURED,
@@ -239,12 +239,23 @@ def _infer(group, vocabulary, tables, parents) -> tuple[tuple[str, str], ...]:
     target = tables.label(group.table)
     if target is None:
         return ()
-    candidates = tuple(
+    # Only a forward many-to-one dereferences to a single row of the *target*
+    # table. A reverse or many-to-many access queries the child table with the
+    # parent's id, which is a different shape entirely, so those relations can
+    # never explain this group and must not dilute the candidate list.
+    found = [
         (info.label, relation.name)
         for info in vocabulary.models.values()
         for relation in info.relations.values()
-        if relation.target == target
-    )
+        if relation.target == target and relation.kind == FORWARD
+    ]
+    # A proxy model repeats its concrete model's relations against the same
+    # table, so it would turn one candidate into two and make a nameable
+    # finding look ambiguous. Collapse on (table, relation).
+    unique: dict[tuple[str, str], tuple[str, str]] = {}
+    for label, name in found:
+        unique.setdefault((tables.table(label) or label, name), (label, name))
+    candidates = tuple(unique.values())
     seen = tuple(pair for pair in candidates if tables.table(pair[0]) in parents)
     return seen or candidates
 
