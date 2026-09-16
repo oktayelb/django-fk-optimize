@@ -18,6 +18,7 @@ Exit status is 0 when both halves behaved, 1 when either did not.
 """
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -99,7 +100,7 @@ call_command("migrate", "--run-syncdb", verbosity=0)
 Book.objects.all().delete()
 Publisher.objects.all().delete()
 publishers = [Publisher.objects.create(name=f"publisher-{i}") for i in range(5)]
-for index in range(60):
+for index in range(200):
     Book.objects.create(title=f"book-{index}", publisher=publishers[index % 5])
 
 with record("recording.jsonl"):
@@ -107,7 +108,10 @@ with record("recording.jsonl"):
 """
 
 RELATION = "shop.Book.publisher"
-FIX = 'select_related("publisher")'
+# Which of the two hints wins is a stopwatch's decision, and a smoke test that
+# asserts the outcome of a race is a smoke test that fails for no reason. What
+# has to be true is that the fix is a join on the right relation.
+FIX = re.compile(r'\.(select|prefetch)_related\("publisher"\)')
 
 
 def write_project(root: Path, view: str) -> None:
@@ -181,7 +185,9 @@ def main(argv=None) -> int:
             "exits 1", before.returncode == 1, f"exit {before.returncode}\n{output}"
         )
         passed &= check(f"names {RELATION}", RELATION in output, output)
-        passed &= check(f"suggests {FIX}", FIX in output, output)
+        passed &= check(
+            "suggests a join on publisher", bool(FIX.search(output)), output
+        )
         passed &= check("says the rows were observed", "(observed)" in output, output)
 
         print("the same code with the fix applied:")
