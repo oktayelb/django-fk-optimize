@@ -387,8 +387,8 @@ class Command(BaseCommand):
         findings = [verdict for verdict in verdicts if verdict.actionable]
         if options["fail_on_findings"] and findings:
             raise CommandError(
-                f"{len(findings)} actionable finding"
-                f"{'s' if len(findings) != 1 else ''} (--fail-on-findings)"
+                f"{report_module.plural(len(findings), 'actionable finding')} "
+                "(--fail-on-findings)"
             )
 
     def _big_enough(self, verdict, cardinality, min_rows) -> bool:

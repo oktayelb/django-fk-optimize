@@ -144,11 +144,34 @@ def test_coverage_reports_what_could_not_be_read():
     assert "42 files" in text
     assert "31 call sites (27 resolved, 4 probable)" in text
     assert "2 querysets the scanner could not follow" in text
-    assert "1 files it could not parse" in text
+    assert "1 file it could not parse" in text
     assert "4812 records, 3 malformed" in text
     assert "1 hour old" in text
     assert "1 with no call site" in text
     assert "2 to no model at all" in text
+
+
+def test_a_count_of_one_reads_as_one():
+    coverage = report.Coverage(
+        files=1,
+        sites=1,
+        models=1,
+        sites_unresolved=1,
+        scan_errors=1,
+        recording_exists=True,
+        records=1,
+        groups=1,
+        relations_benchmarked=1,
+    )
+
+    text = text_of([], coverage)
+
+    assert "1 file, 1 model, 1 call site" in text
+    assert "1 queryset the scanner could not follow" in text
+    assert "1 file it could not parse" in text
+    assert "1 record," in text
+    assert "1 query group," in text
+    assert "1 relation timed" in text
 
 
 def test_a_timed_out_run_says_the_results_are_partial():

@@ -96,10 +96,17 @@ def milliseconds(seconds: float | None) -> str:
     return f"{seconds * 1000:.1f} ms"
 
 
+def plural(count: int, singular: str, many: str = "") -> str:
+    """`1 file`, `2 files`. A count is not an excuse for `1 relations`."""
+    if count == 1:
+        return f"{count} {singular}"
+    return f"{count} {many or singular + 's'}"
+
+
 def queries(count: int | None) -> str:
     if count is None:
         return "n/a"
-    return "1 query" if count == 1 else f"{count} queries"
+    return plural(count, "query", "queries")
 
 
 def age(seconds: float | None) -> str:
@@ -107,8 +114,7 @@ def age(seconds: float | None) -> str:
         return "unknown age"
     for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
         if seconds >= size:
-            value = int(seconds // size)
-            return f"{value} {unit}{'s' if value != 1 else ''} old"
+            return f"{plural(int(seconds // size), unit)} old"
     return f"{int(seconds)}s old"
 
 
@@ -238,15 +244,17 @@ def _coverage(coverage: Coverage) -> list[tuple[str, str]]:
         lines.append(
             _row(
                 "scanned",
-                f"{coverage.files} files, {coverage.models} models, "
-                f"{coverage.sites} call sites "
+                f"{plural(coverage.files, 'file')}, "
+                f"{plural(coverage.models, 'model')}, "
+                f"{plural(coverage.sites, 'call site')} "
                 f"({coverage.sites_resolved} resolved, "
                 f"{coverage.sites_probable} probable)",
             )
         )
         unseen = (
-            f"{coverage.sites_unresolved} querysets the scanner could not follow, "
-            f"{coverage.scan_errors} files it could not parse"
+            f"{plural(coverage.sites_unresolved, 'queryset')} "
+            "the scanner could not follow, "
+            f"{plural(coverage.scan_errors, 'file')} it could not parse"
         )
         lines.append(_row("not seen", unseen))
     else:
@@ -256,8 +264,10 @@ def _coverage(coverage: Coverage) -> list[tuple[str, str]]:
         lines.append(
             _row(
                 "recording",
-                f"{relative(coverage.recording_path)}  {coverage.records} records, "
-                f"{coverage.malformed} malformed, {coverage.groups} query groups, "
+                f"{relative(coverage.recording_path)}  "
+                f"{plural(coverage.records, 'record')}, "
+                f"{coverage.malformed} malformed, "
+                f"{plural(coverage.groups, 'query group')}, "
                 f"{age(coverage.recording_age_seconds)}",
             )
         )
@@ -279,7 +289,10 @@ def _coverage(coverage: Coverage) -> list[tuple[str, str]]:
         lines.append(_row("benchmark", "skipped (--no-benchmark)"))
     else:
         lines.append(
-            _row("benchmark", f"{coverage.relations_benchmarked} relations timed")
+            _row(
+                "benchmark",
+                f"{plural(coverage.relations_benchmarked, 'relation')} timed",
+            )
         )
     if coverage.timed_out:
         lines.append(
@@ -307,7 +320,7 @@ def render_text(verdicts, coverage: Coverage) -> list[tuple[str, str]]:
     if findings:
         lines.append(
             (
-                f"{len(findings)} change{'s' if len(findings) != 1 else ''} worth making",
+                f"{plural(len(findings), 'change')} worth making",
                 WARNING,
             )
         )
@@ -321,8 +334,7 @@ def render_text(verdicts, coverage: Coverage) -> list[tuple[str, str]]:
         lines.append(("", PLAIN))
         lines.append(
             (
-                f"{len(unsure)} site{'s' if len(unsure) != 1 else ''} this run "
-                "could not fully account for",
+                f"{plural(len(unsure), 'site')} this run could not fully account for",
                 HEADING,
             )
         )
