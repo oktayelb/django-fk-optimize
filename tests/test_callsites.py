@@ -181,3 +181,141 @@ def test_scan_files_aggregates(tmp_path, vocabulary):
 
     assert report.files == 2
     assert {site.touched[0] for site in report.sites} == {"author", "publisher"}
+
+
+# -- enclosing scope ---------------------------------------------------
+#
+# The runtime recorder attributes a lazy load to the line that touched the
+# relation, which is never the line that built the queryset.  These fields are
+# what lets the two be joined.
+
+
+def test_module_level_site_is_stamped_with_the_module_scope(vocabulary):
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.all():\n    print(book.publisher.name)\n",
+    )
+
+    assert site.function == "<module>"
+    assert site.scope_start == 1
+    assert site.scope_end == 3
+    assert site.contains_line(site.line)
+
+
+def test_function_level_site_is_stamped_with_the_function(vocabulary):
+    site = only_site(
+        vocabulary,
+        "\n".join(
+            [
+                "def listing():",
+                "    books = Book.objects.all()",
+                "    for book in books:",
+                "        print(book.publisher.name)",
+                "",
+            ]
+        ),
+    )
+
+    assert site.function == "listing"
+    assert site.scope_start == 2  # the `def`, after the import header
+    assert site.scope_end == 5
+    # The queryset line and the touch line are different lines; both are in.
+    assert site.contains_line(3)
+    assert site.contains_line(5)
+    assert not site.contains_line(1)
+
+
+def test_method_is_stamped_with_the_method_not_the_class(vocabulary):
+    site = only_site(
+        vocabulary,
+        "\n".join(
+            [
+                "class View:",
+                "    def get(self):",
+                "        for book in Book.objects.all():",
+                "            print(book.publisher.name)",
+                "",
+            ]
+        ),
+    )
+
+    assert site.function == "get"
+    assert site.scope_start == 3
+    assert site.scope_end == 5
+
+
+def test_nested_function_gets_the_narrowest_scope(vocabulary):
+    report = scan(
+        vocabulary,
+        "\n".join(
+            [
+                "def outer():",
+                "    for book in Book.objects.all():",
+                "        print(book.publisher.name)",
+                "",
+                "    def inner():",
+                "        for other in Book.objects.all():",
+                "            print(other.author.name)",
+                "",
+            ]
+        ),
+    )
+
+    by_function = {site.function: site for site in report.sites}
+    assert set(by_function) == {"outer", "inner"}
+
+    outer = by_function["outer"]
+    inner = by_function["inner"]
+    assert (outer.scope_start, outer.scope_end) == (2, 8)
+    assert (inner.scope_start, inner.scope_end) == (6, 8)
+    # Both contain the inner touch line; the narrower one is the right answer,
+    # which is the join's job, not the scanner's.
+    assert outer.contains_line(8) and inner.contains_line(8)
+    assert outer.contains_line(4) and not inner.contains_line(4)
+
+
+def test_async_function_is_a_scope_too(vocabulary):
+    site = only_site(
+        vocabulary,
+        "\n".join(
+            [
+                "async def listing():",
+                "    for book in Book.objects.all():",
+                "        print(book.publisher.name)",
+                "",
+            ]
+        ),
+    )
+
+    assert site.function == "listing"
+    assert (site.scope_start, site.scope_end) == (2, 4)
+
+
+def test_instance_site_is_stamped_too(vocabulary):
+    site = only_site(
+        vocabulary,
+        "\n".join(
+            [
+                "def detail(pk):",
+                "    book = Book.objects.get(pk=pk)",
+                "    return book.publisher.name",
+                "",
+            ]
+        ),
+    )
+
+    assert site.kind == INSTANCE
+    assert site.function == "detail"
+    assert (site.scope_start, site.scope_end) == (2, 4)
+
+
+def test_scope_is_reachable_as_one_object(vocabulary):
+    from django_fk_optimize.utils.callsites import Scope
+
+    site = only_site(
+        vocabulary,
+        "def f():\n    for book in Book.objects.all():\n        print(book.author)\n",
+    )
+
+    assert site.scope == Scope("f", 2, 4)
+    assert site.scope.contains(3)

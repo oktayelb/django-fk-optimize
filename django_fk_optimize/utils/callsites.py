@@ -128,6 +128,27 @@ class Binding:
     origin: str = ""  # the chain this started as, for a name that hides it
 
 
+@dataclass(frozen=True)
+class Scope:
+    """The function a call site sits in, and the lines that function spans.
+
+    A runtime recorder attributes a lazy load to the line that *touched* the
+    relation; this scanner files the site at the line that built the queryset.
+    Those are never the same line, so the only thing the two halves can be
+    joined on is the enclosing function.
+    """
+
+    function: str = ""
+    start: int = 0
+    end: int = 0
+
+    def contains(self, line: int) -> bool:
+        return self.start <= line <= self.end
+
+
+MODULE_SCOPE_NAME = "<module>"
+
+
 @dataclass
 class CallSite:
     path: str
@@ -143,6 +164,20 @@ class CallSite:
     escapes: bool = False
     confidence: str = RESOLVED
     notes: tuple[str, ...] = ()
+
+    # The enclosing scope, for matching a runtime line back to this site.
+    # "<module>" and the module's span when the site is not inside a function.
+    function: str = ""
+    scope_start: int = 0
+    scope_end: int = 0
+
+    @property
+    def scope(self) -> Scope:
+        return Scope(self.function, self.scope_start, self.scope_end)
+
+    def contains_line(self, line: int) -> bool:
+        """Is `line` inside the function this site was written in?"""
+        return self.scope_start <= line <= self.scope_end
 
     @property
     def missing(self) -> tuple[str, ...]:
@@ -236,11 +271,11 @@ class _Scanner:
         }
 
     def run(self):
-        self._scope_of(self.tree.body, {})
+        self._scope_of(self.tree.body, {}, _module_scope(self.tree))
 
     # -- scopes --------------------------------------------------------
 
-    def _scope_of(self, body, inherited):
+    def _scope_of(self, body, inherited, scope_info):
         """Walk one scope, then look for touches on the instances it bound.
 
         Bindings are last-write-wins in source order; branches are not tracked.
@@ -251,7 +286,7 @@ class _Scanner:
         instances: dict[str, tuple[Binding, ast.AST]] = {}
 
         for node in body:
-            self._statement(node, scope, instances)
+            self._statement(node, scope, instances, scope_info)
 
         for name, (binding, origin) in instances.items():
             touched, id_only, escapes = _touches(body, name, binding.model)
@@ -273,21 +308,29 @@ class _Scanner:
                     confidence=PROBABLE if escapes else binding.confidence,
                     notes=binding.notes
                     + (("instance escapes into a call",) if escapes else ()),
+                    function=scope_info.function,
+                    scope_start=scope_info.start,
+                    scope_end=scope_info.end,
                 )
             )
 
-    def _statement(self, node, scope, instances):
+    def _statement(self, node, scope, instances, scope_info):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            self._scope_of(node.body, scope)
+            # A class body is not a function, so it inherits the scope it is
+            # written in; a def -- including a nested one -- starts its own.
+            inner = scope_info
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                inner = _function_scope(node)
+            self._scope_of(node.body, scope, inner)
             return
 
         if isinstance(node, ast.Assign):
             self._assign(node, scope, instances)
         elif isinstance(node, (ast.For, ast.AsyncFor)):
-            self._loop(node, scope)
+            self._loop(node, scope, scope_info)
 
         for child in _child_statements(node):
-            self._statement(child, scope, instances)
+            self._statement(child, scope, instances, scope_info)
 
         for sub in ast.walk(node):
             if not isinstance(
@@ -300,7 +343,7 @@ class _Scanner:
             if id(sub) in self._seen:
                 continue
             self._seen.add(id(sub))
-            self._comprehension(sub, scope)
+            self._comprehension(sub, scope, scope_info)
 
     def _assign(self, node, scope, instances):
         binding = self._resolve(node.value, scope)
@@ -313,7 +356,7 @@ class _Scanner:
             if binding.kind == INSTANCE:
                 instances[target.id] = (binding, node.value)
 
-    def _loop(self, node, scope):
+    def _loop(self, node, scope, scope_info):
         binding = self._resolve(node.iter, scope)
         if binding is TERMINAL_CHAIN:
             return
@@ -323,9 +366,11 @@ class _Scanner:
         if binding.kind == INSTANCE:
             return
         if isinstance(node.target, ast.Name):
-            self._record_iteration(node.iter, node.target.id, binding, node.body)
+            self._record_iteration(
+                node.iter, node.target.id, binding, node.body, scope_info
+            )
 
-    def _comprehension(self, node, scope):
+    def _comprehension(self, node, scope, scope_info):
         for generator in node.generators:
             binding = self._resolve(generator.iter, scope)
             if binding is TERMINAL_CHAIN:
@@ -341,9 +386,10 @@ class _Scanner:
                 generator.target.id,
                 binding,
                 body + list(generator.ifs),
+                scope_info,
             )
 
-    def _record_iteration(self, origin, varname, binding, body):
+    def _record_iteration(self, origin, varname, binding, body, scope_info):
         touched, id_only, escapes = _touches(body, varname, binding.model)
         # `for a in qs:` says nothing about what qs is; the binding remembers.
         expression = _source(origin)
@@ -369,6 +415,9 @@ class _Scanner:
                 escapes=escapes,
                 confidence=confidence,
                 notes=notes,
+                function=scope_info.function,
+                scope_start=scope_info.start,
+                scope_end=scope_info.end,
             )
         )
 
@@ -450,6 +499,21 @@ class _Scanner:
 # ----------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------
+
+
+def _end_line(node, default=0):
+    return getattr(node, "end_lineno", None) or getattr(node, "lineno", default)
+
+
+def _module_scope(tree) -> Scope:
+    end = max((_end_line(node) for node in tree.body), default=0)
+    return Scope(MODULE_SCOPE_NAME, 1, end)
+
+
+def _function_scope(node) -> Scope:
+    # Decorators sit above `node.lineno`, so a site cannot be inside one and
+    # the span deliberately starts at the `def`.
+    return Scope(node.name, node.lineno, _end_line(node, node.lineno))
 
 
 def _unwind(node):
