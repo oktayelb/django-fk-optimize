@@ -136,3 +136,32 @@ def test_reverse_one_to_one_has_its_own_kind():
 
     assert plan_named(Author, "profile").kind == bench.REVERSE_ONE_TO_ONE
     assert plan_named(Publisher, "book_set").kind == bench.REVERSE
+
+
+def test_compare_survives_every_relation_kind(library):
+    """The regression the command was born from, at the layer that measures."""
+    from tests.testapp.models import Author, Book, Note, Publisher, Tag, Textbook
+
+    timer = Benchmark(sample_size=6, repeat=1)
+    for model in (Publisher, Tag, Author, Book, Textbook, Note):
+        for plan in bench.plans_for(model):
+            result = timer.compare(model, plan)
+            assert result.winner in result.measurements
+            assert FieldOperation.VANILLA in result.measurements
+            if not plan.can_select_related:
+                assert FieldOperation.SELECT_RELATED not in result.measurements
+
+
+def test_a_whole_sweep_records_nothing(library, tmp_path):
+    from tests.testapp.models import Book, Publisher
+
+    path = tmp_path / "recording.jsonl"
+    timer = Benchmark(sample_size=6, repeat=1)
+
+    with recording.record(path) as recorder:
+        for model in (Publisher, Book):
+            for plan in bench.plans_for(model):
+                timer.compare(model, plan)
+
+    assert recorder.written == 0
+    assert not path.exists()

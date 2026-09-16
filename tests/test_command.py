@@ -6,6 +6,7 @@ thirteen queries into one on any machine on any day.
 """
 
 import io
+import json
 
 import pytest
 from django.core.management import call_command
@@ -321,3 +322,232 @@ def test_unknown_selection_is_a_command_error():
         run("nosuchapp")
     with pytest.raises(CommandError):
         run("testapp.NoSuchModel")
+
+
+# -- the verdict report, end to end ------------------------------------
+#
+# The default mode: scan the source, read the recording, join the two, price
+# the alternative. Asserted on what the report says, never on how long it took.
+
+
+@pytest.fixture(autouse=True)
+def clean_recorder_state():
+    from django_fk_optimize import recording
+
+    recording.reset()
+    yield
+    recording.reset()
+
+
+@pytest.fixture
+def recorded(tmp_path, library):
+    """A real recording of a real N+1, made by running the real call site."""
+    from django_fk_optimize import recording
+    from tests.testapp import views
+
+    path = tmp_path / "recording.jsonl"
+    with recording.record(path):
+        views.book_list()
+    assert path.exists()
+    return path
+
+
+def report(*args, **options):
+    return run("testapp", "--repeat", "1", "--sample-size", "12", *args, **options)
+
+
+def test_it_works_with_no_recording_and_says_n_was_estimated(library, tmp_path):
+    output = report("--recording", str(tmp_path / "absent.jsonl"))
+
+    assert "testapp.Book.publisher" in output
+    assert "(estimated)" in output
+    assert "(observed)" not in output
+    assert "none at" in output
+    assert "FkOptimizeMiddleware" in output
+
+
+def test_a_recording_turns_the_estimate_into_an_observation(recorded):
+    output = report("--recording", str(recorded))
+
+    assert "(observed)" in output
+    assert "book_list()" in output
+    assert "13 records" in output  # one page query, then one per book
+    assert "1 to a call site" in output
+    assert 'select_related("publisher")' in output
+
+
+def test_the_id_only_call_site_is_reported_as_fine_not_as_a_finding(library, tmp_path):
+    output = report("--recording", str(tmp_path / "absent.jsonl"))
+
+    assert "already fine" in output
+    assert "publisher_id is already on the row" in output
+
+
+def test_an_unused_hint_is_offered_for_removal(library, tmp_path):
+    output = report("--recording", str(tmp_path / "absent.jsonl"))
+
+    assert 'select_related("author") is never used here' in output
+
+
+def test_json_parses_and_carries_the_coverage_block(recorded):
+    payload = json.loads(report("--recording", str(recorded), "--json"))
+
+    assert payload["schema_version"] == 1
+    assert payload["generated_at"]
+    coverage = payload["coverage"]
+    for key in (
+        "files",
+        "sites",
+        "sites_resolved",
+        "sites_unresolved",
+        "scan_errors",
+        "records",
+        "malformed",
+        "recording_age_seconds",
+    ):
+        assert key in coverage, key
+    assert coverage["records"] == 13
+    assert coverage["recording_exists"] is True
+
+    observed = [v for v in payload["verdicts"] if v["rows"]["provenance"] == "observed"]
+    assert observed, payload["verdicts"]
+    assert observed[0]["relation"] == "publisher"
+    assert observed[0]["best"]["queries"] == 1
+
+
+def test_json_to_stdout_replaces_the_text_report(recorded):
+    output = report("--recording", str(recorded), "--json")
+
+    assert output.lstrip().startswith("{")
+    assert "coverage\n" not in output
+
+
+def test_json_to_a_path_is_written_alongside_the_text(recorded, tmp_path):
+    destination = tmp_path / "out" / "report.json"
+
+    output = report("--recording", str(recorded), "--json", str(destination))
+
+    assert "changes worth making" in output
+    assert json.loads(destination.read_text())["schema_version"] == 1
+
+
+def test_fail_on_findings_exits_non_zero(recorded):
+    with pytest.raises(CommandError) as raised:
+        report("--recording", str(recorded), "--fail-on-findings")
+
+    assert "actionable finding" in str(raised.value)
+
+
+def test_fail_on_findings_is_quiet_when_there_is_nothing_to_find(recorded):
+    # Textbook inherits Book's relations but no call site iterates it.
+    run(
+        "testapp.Tag",
+        "--recording",
+        str(recorded),
+        "--repeat",
+        "1",
+        "--fail-on-findings",
+    )
+
+
+def test_timeout_still_prints_what_it_had(recorded):
+    output = report("--recording", str(recorded), "--timeout", "0")
+
+    assert "cut short" in output
+    assert "partial" in output
+    assert "0 relations timed" in output
+
+
+def test_no_benchmark_skips_the_timing_and_says_so(recorded):
+    output = report("--recording", str(recorded), "--no-benchmark")
+
+    assert "skipped (--no-benchmark)" in output
+    assert "measured" not in output
+    assert "(observed)" in output
+
+
+def test_clear_recording_removes_the_file_after_reading_it(recorded):
+    output = report("--recording", str(recorded), "--clear-recording")
+
+    assert "(observed)" in output  # it was read before it was cleared
+    assert not recorded.exists()
+
+
+def test_min_rows_ignores_a_table_that_is_too_small(recorded):
+    output = report("--recording", str(recorded), "--min-rows", "1000")
+
+    assert "no change worth making" in output
+
+
+def test_django_models_still_works_and_says_it_is_deprecated(library, tmp_path):
+    out, err = io.StringIO(), io.StringIO()
+    call_command(
+        "fk_optimize",
+        "testapp",
+        "--no-callsites",
+        "--repeat",
+        "1",
+        "--sample-size",
+        "2",
+        "--django-models",
+        stdout=out,
+        stderr=err,
+    )
+
+    assert "deprecated" in err.getvalue()
+    assert "--include-django" in err.getvalue()
+
+
+def test_min_rows_cannot_be_negative():
+    with pytest.raises(CommandError):
+        run("testapp", "--min-rows", "-1")
+
+
+def test_a_template_n_plus_one_is_reported_with_no_call_site(library, tmp_path):
+    """Trap B, end to end: no AST can see `{{ book.publisher.name }}`."""
+    import time
+
+    from django_fk_optimize.recording import store
+
+    path = tmp_path / "recording.jsonl"
+    page = 'SELECT "testapp_book"."id" FROM "testapp_book"'
+    lookup = (
+        'SELECT "testapp_publisher"."id" FROM "testapp_publisher" '
+        'WHERE "testapp_publisher"."id" = ?'
+    )
+    records = [
+        store.Record(
+            ts=time.time(),
+            shape=page,
+            shape_hash="page",
+            duration=0.001,
+            file="/elsewhere/shop/views.py",
+            line=31,
+            function="catalogue",
+            source="python",
+        )
+    ] + [
+        store.Record(
+            ts=time.time(),
+            shape=lookup,
+            shape_hash="lookup",
+            duration=0.002,
+            file="/elsewhere/shop/views.py",
+            line=31,
+            function="catalogue",
+            source="template",
+        )
+        for _ in range(40)
+    ]
+    store.append(path, records)
+
+    output = report("--recording", str(path))
+
+    assert "catalogue()" in output
+    assert "testapp.Book.publisher" in output
+    assert "40  (observed)" in output
+    assert "template" in output
+    assert "no call site" in output
+    assert 'add .select_related("publisher")' in output
+    assert "catalogue()" in output
+    assert "1 with no call site" in output
