@@ -379,6 +379,9 @@ class Verdict:
     # over too few rows is noise, and a pick made from noise must not print
     # like a pick made from evidence.
     basis: str = MEASURED
+    # For REMOVE_HINT: the method the unused hint was written with, kept so
+    # the fix can be recomputed against a line that has other changes on it.
+    hint_method: str = ""
     best_strategy: str = ""
     best: Measurement | None = None
     alternative_strategy: str = ""
@@ -509,6 +512,74 @@ def without_hint(expression: str, method: str, name: str) -> str:
     return changed
 
 
+def rewrite(verdict: Verdict, expression: str, *, prefetch: bool = False) -> str:
+    """`expression` with this one verdict's change applied.
+
+    Split out of `fit()` so the same rule can be replayed over a line that
+    several verdicts change, instead of each one rewriting the original and
+    quietly discarding what the others said.
+    """
+    method = (
+        FieldOperation.PREFETCH_RELATED.value
+        if prefetch
+        else FieldOperation.SELECT_RELATED.value
+    )
+    if verdict.kind in (N_PLUS_ONE, EXTRA_QUERY):
+        return with_hint(expression, method, verdict.relation)
+    if verdict.kind == SWITCH_TO_SELECT:
+        dropped = without_hint(
+            expression, FieldOperation.PREFETCH_RELATED.value, verdict.relation
+        )
+        return with_hint(dropped, FieldOperation.SELECT_RELATED.value, verdict.relation)
+    if verdict.kind == REMOVE_HINT:
+        return without_hint(
+            expression,
+            verdict.hint_method or FieldOperation.SELECT_RELATED.value,
+            verdict.relation,
+        )
+    return expression
+
+
+def reconcile(verdicts: Iterable[Verdict]) -> int:
+    """Make every change on one line agree with the others on that line.
+
+    Each verdict rewrites the call site it was built from, so two findings on
+    the same line each produced a fix that undid the other: one said to keep
+    select_related('subnet'), the next said to keep select_related('site'),
+    and both were right on their own and wrong together. Seen in the wild on
+    a line with two unused hints and on a line with two missing ones.
+
+    So the fix line for a shared call site shows the finished line -- every
+    change on it, applied -- and each verdict keeps its own rows, evidence and
+    measurements.
+    """
+    shared: dict[tuple[str, int, str], list[Verdict]] = {}
+    for verdict in verdicts:
+        if not verdict.actionable or verdict.runtime_only or not verdict.expression:
+            continue
+        shared.setdefault((verdict.file, verdict.line, verdict.expression), []).append(
+            verdict
+        )
+
+    reconciled = 0
+    for (_path, _line, expression), members in shared.items():
+        if len(members) < 2:
+            continue
+        text = expression
+        for verdict in sorted(members, key=lambda item: item.relation):
+            text = rewrite(
+                verdict,
+                text,
+                prefetch=verdict.best_strategy == FieldOperation.PREFETCH_RELATED.value,
+            )
+        note = f"{len(members)} changes on this line; the fix shows all of them applied"
+        for verdict in members:
+            verdict.fix = text
+            verdict.notes = verdict.notes + (note,)
+        reconciled += 1
+    return reconciled
+
+
 def fit(verdict: Verdict, *, prefetch: bool = False) -> None:
     """(Re)write the verdict's one-line fix for its current best strategy."""
     method = (
@@ -526,16 +597,9 @@ def fit(verdict: Verdict, *, prefetch: bool = False) -> None:
                 else f"add a select_related() for the query in {where}"
             )
         else:
-            verdict.fix = with_hint(verdict.expression, method, verdict.relation)
+            verdict.fix = rewrite(verdict, verdict.expression, prefetch=prefetch)
     elif verdict.kind == SWITCH_TO_SELECT:
-        dropped = without_hint(
-            verdict.expression,
-            FieldOperation.PREFETCH_RELATED.value,
-            verdict.relation,
-        )
-        verdict.fix = with_hint(
-            dropped, FieldOperation.SELECT_RELATED.value, verdict.relation
-        )
+        verdict.fix = rewrite(verdict, verdict.expression, prefetch=prefetch)
     verdict.best_strategy = verdict.best_strategy or method
 
 
@@ -658,6 +722,7 @@ def _site_verdicts(site, observed, vocabulary, cardinality, sample_size):
         )
         verdict = _base(site, REMOVE_HINT, relation, Rows(0, UNKNOWN))
         verdict.actionable = True
+        verdict.hint_method = method
         verdict.headline = f'{method}("{relation}") is never used here'
         verdict.fix = without_hint(verdict.expression, method, relation)
         _soften(verdict, site)

@@ -48,7 +48,7 @@ from ...analysis.benchmark import (
 )
 from ...analysis.cardinality import Cardinalities
 from ...analysis.report import Coverage, render_text
-from ...analysis.verdicts import Costed, Tables, build, cost
+from ...analysis.verdicts import Costed, Tables, build, cost, reconcile
 from ...recording import store
 from ...utils.callsites import PROBABLE, RESOLVED, scan_files
 from ...utils.sources import discover
@@ -346,6 +346,10 @@ class Command(BaseCommand):
         costed = Costed()
         if options["benchmark"] and not deadline.expired():
             costed = cost(verdicts, self.benchmark(), by_label.get, deadline)
+
+        # After costing, so a line's combined fix is written with the
+        # strategies the measurements actually chose.
+        reconcile(verdicts)
 
         coverage = Coverage(
             files=scan.files,

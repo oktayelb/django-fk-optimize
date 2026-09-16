@@ -662,3 +662,65 @@ def test_the_skipped_relation_does_not_stop_the_next_one(vocabulary, tables):
     assert costed.skipped == 1, "the unreadable one is skipped"
     assert costed.timed == 1, "and the next one is still priced"
     assert any(v.best is not None for v in verdicts), "the survivor kept its numbers"
+
+
+# ----------------------------------------------------------------------
+# several changes on one line
+# ----------------------------------------------------------------------
+
+TWO_UNUSED_HINTS = """
+from tests.testapp.models import Book
+
+
+def listing():
+    books = Book.objects.select_related('publisher', 'author')
+    for book in books:
+        send(book.title)
+"""
+
+
+def test_two_changes_on_one_line_do_not_contradict(vocabulary, tables):
+    """The unitel-star bug: each fix undid the other.
+
+    One verdict said to keep select_related('author'), the next said to keep
+    select_related('publisher'). Applied together they contradict; applied
+    one at a time they silently drop the other's finding.
+    """
+    sites = sites_for(TWO_UNUSED_HINTS, vocabulary)
+    verdicts, _ = V.build(sites, [], vocabulary, tables, cardinality=counts())
+    removals = [v for v in verdicts if v.kind == V.REMOVE_HINT]
+    assert len(removals) == 2, [v.kind for v in verdicts]
+    assert removals[0].fix != removals[1].fix, "before reconciling they disagree"
+
+    assert V.reconcile(verdicts) == 1
+
+    assert removals[0].fix == removals[1].fix, "one line, one finished form"
+    assert "publisher" not in removals[0].fix
+    assert "author" not in removals[0].fix
+    for verdict in removals:
+        assert any("2 changes on this line" in note for note in verdict.notes)
+
+
+def test_two_missing_hints_on_one_line_are_added_together(vocabulary, tables):
+    """Both relations end up in the fix, not one each."""
+    sites = sites_for(TWO_UNHINTED, vocabulary)
+    verdicts, _ = V.build(sites, [], vocabulary, tables, cardinality=counts())
+    findings = [v for v in verdicts if v.actionable]
+    assert len(findings) == 2
+
+    V.reconcile(verdicts)
+
+    assert findings[0].fix == findings[1].fix
+    assert 'select_related("publisher")' in findings[0].fix
+    assert 'select_related("author")' in findings[0].fix
+
+
+def test_a_line_with_one_change_is_left_exactly_as_it_was(vocabulary, tables):
+    sites = sites_for(SIMPLE, vocabulary)
+    verdicts, _ = V.build(sites, [], vocabulary, tables, cardinality=counts())
+    finding = only(verdicts, V.N_PLUS_ONE)
+    before = finding.fix
+
+    assert V.reconcile(verdicts) == 0
+    assert finding.fix == before
+    assert not any("changes on this line" in note for note in finding.notes)
