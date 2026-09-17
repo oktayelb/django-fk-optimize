@@ -12,7 +12,10 @@ and a few seconds of parsing, and any project can be added by one line.
 What it enforces, from `corpus-baseline.json`:
 
 * nothing raises -- an unhandled exception on any project fails the run;
-* parse failures stay at or below the recorded allowance;
+* parse failures stay at or below the recorded allowance, and are printed with
+  the parser's own message beside them: a file that will not parse is as often
+  newer than the interpreter reading it as it is broken, and the count alone
+  cannot tell those apart -- the run prints its python version for that reason;
 * models, call sites and followed expressions stay at or above the recorded
   floors, so a scanner that quietly stops resolving anything cannot pass;
 * the census adds up -- every manager expression the scanner met is either
@@ -102,6 +105,27 @@ def revision(path: Path) -> str:
         return "unknown"
 
 
+def where(errors, root: Path, limit: int = 8) -> list[str]:
+    """`path: message` for each file that would not parse.
+
+    The count on its own sends the next person off to clone the project and
+    reproduce the run before they can even see what broke.  The parser's own
+    message is usually the whole answer, and frequently says that this
+    interpreter is older than the code it was handed rather than that the code
+    is wrong -- a distinction no number can carry.
+    """
+    lines = []
+    for place, message in errors[:limit]:
+        try:
+            place = str(Path(place).relative_to(root))
+        except ValueError:
+            pass
+        lines.append(f"{place}: {message}")
+    if len(errors) > limit:
+        lines.append(f"... and {len(errors) - limit} more")
+    return lines
+
+
 def analyse(path: Path) -> dict:
     """Everything the scanner can say about one project, without running it."""
     from django_fk_optimize.utils.callsites import PROBABLE, RESOLVED, scan_files
@@ -126,8 +150,10 @@ def analyse(path: Path) -> dict:
         "relations": stats.relations,
         "unresolved_targets": len(stats.unresolved_targets),
         "model_parse_errors": len(stats.errors),
+        "model_parse_error_detail": where(stats.errors, path),
         "files": scanned.files,
         "parse_errors": len(scanned.errors),
+        "parse_error_detail": where(scanned.errors, path),
         "sites": len(sites),
         "sites_resolved": sum(1 for s in sites if s.confidence == RESOLVED),
         "sites_probable": sum(1 for s in sites if s.confidence == PROBABLE),
@@ -155,9 +181,10 @@ def check(name: str, result: dict, floors: dict) -> list[str]:
     for key in ("parse_errors", "model_parse_errors"):
         allowed = floors.get(key, 0)
         if result[key] > allowed:
-            problems.append(
-                f"{name}: {key} rose to {result[key]}, allowance is {allowed}"
-            )
+            problem = f"{name}: {key} rose to {result[key]}, allowance is {allowed}"
+            for line in result[f"{key.removesuffix('s')}_detail"]:
+                problem += f"\n    {line}"
+            problems.append(problem)
     # Not a floor and not a matter of degree. The three buckets partition the
     # expressions the scanner met, so if they do not sum to `seen` the census
     # is miscounting and every coverage figure taken from it is fiction.
@@ -198,6 +225,11 @@ def main(argv=None) -> int:
     root = Path(options.workdir or tempfile.mkdtemp(prefix="fk-corpus-"))
     root.mkdir(parents=True, exist_ok=True)
     names = options.only or list(PROJECTS)
+
+    # Printed because it is half of every parse failure below: these projects
+    # are read with whatever grammar this interpreter knows, and they adopt new
+    # syntax on their own schedule, not ours.
+    print(f"python {sys.version.split()[0]}")
 
     baseline = {}
     if BASELINE.exists():
