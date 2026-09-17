@@ -11,6 +11,37 @@ one relation at a time, instead of guessing from the model definitions.
 
 ### Fixed
 
+- **N is the N of one call.** `QueryGroup.count` was folded across the whole
+  recording, so a view exercised three times over 200 rows reported
+  `rows 600 (observed)`, `1 + 600 queries`, and `~23.3 ms per call` — beside a
+  `200 fewer queries` the benchmark had measured correctly, the report
+  contradicting itself four lines apart. Every record now carries the id of the
+  recorder that wrote it, one recorder being one request or one `record()`
+  block, and `count` is the median across invocations. `total`, `invocations`
+  and a per-invocation `seconds` are stated separately, and a recording written
+  before run ids existed reads as the single invocation it always was.
+- **A recorded N+1 traced to a call site can no longer vanish.** When the table
+  did not confirm the relation and no single candidate followed, the match was
+  counted in `findings_matched`, printed as `traced 1 to a call site`, and then
+  dropped without a verdict — matching a finding deleted it, while failing to
+  match one at least left it in `runtime_only`. Every matched group now produces
+  a verdict, and an invariant test over seven awkward join outcomes holds the
+  line.
+- **A relation chain is reported whole.** `book.publisher.country` yielded
+  `select_related("publisher")`, which fixes one of the two queries per row;
+  applying it then made the site read `already covered by select_related(...)`
+  for good, so the surviving N+1 became invisible to the tool that found it. The
+  scanner walks the chain, `covers()` understands that only a *deeper* hint
+  covers a hop, and the fix reads `select_related("publisher__country")`. The
+  block counts both hops: 200 rows, 400 extra queries, 400 fewer once fixed.
+- **`--fail-on-findings` fires on your code, and on evidence.** Every installed
+  third-party app was scanned, reported and counted, so a project with DRF or
+  allauth installed failed its build on library source with no flag to turn it
+  off. Apps installed into site-packages are now excluded unless
+  `--include-third-party` says otherwise (an editable install is your code and
+  is always scanned). Findings with no rows behind them are still printed but no
+  longer fail a build, and the number passed over is reported rather than
+  silently dropped.
 - **`fk_optimize` no longer crashes on most models.** `Model._meta.get_fields()`
   returns `ForeignObjectRel` objects for reverse FK, reverse one-to-one and
   many-to-many relations. Those names were passed straight into
@@ -41,6 +72,24 @@ one relation at a time, instead of guessing from the model definitions.
 
 ### Added
 
+- The scanner resolves a queryset bound to a class attribute, returned by a
+  method, or stashed on `self` — `queryset = Book.objects.all()` on a DRF
+  ViewSet, `self.get_queryset()` on a class-based view, `self.books` assigned in
+  one method and looped in another. Between them those shapes are most of the
+  Django written since 2013, and every one of them previously produced no call
+  site *and* no warning that anything had been missed. Tuple assignment binds
+  element-wise too.
+- Relation paths: `touched`, `missing`, `unused` and the hints that cover them
+  all speak Django's `__` spelling, and the benchmark times a whole path by
+  walking every hop.
+- `--include-third-party`, off by default.
+- A census of every queryset expression in the scanned source, split into
+  `followed`, `terminal` and `not followed`, replacing a `coverage: 97.7%` whose
+  denominator excluded everything the scanner had missed. The same figure on
+  django-machina is 2.1%, which is the honest one: 4 expressions of 190
+  resolved.
+- `Recording.invocations` — how many separate calls a recording covers, counted
+  from the run ids rather than folded out of the groups, which can only floor it.
 - Call-site analysis covers reverse and many-to-many relations, not just
   forward foreign keys. A related manager is treated as one: reading it is
   free, `.all()`/`.count()`/`.exists()` are served by a prefetch and

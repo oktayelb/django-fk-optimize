@@ -71,7 +71,7 @@ python manage.py fk_optimize shop.Book
 1 change worth making
 
 shop/views.py:6  catalogue()                      shop.Book.publisher
-  rows        120  (observed)
+  rows        120  (observed)  median of 12 calls
   what        120 extra queries, one per row
   current     1 + 120 queries     1.4 ms recorded sql / 15.2 ms measured
   best        select_related    1 query     0.7 ms measured
@@ -85,8 +85,9 @@ shop/views.py:6  catalogue()                      shop.Book.publisher
 
 coverage
   scanned     24 files, 4 models, 3 call sites (3 resolved, 0 probable)
-  not seen    0 querysets the scanner could not follow, 0 files it could not parse
-  recording   .fk_optimize/recording.jsonl  121 records, 0 malformed, 2 query groups, 0s old
+  querysets   9 expressions seen: 3 followed, 4 terminal, 2 not followed
+  not seen    0 files it could not parse
+  recording   .fk_optimize/recording.jsonl  1452 records over 12 invocations, 0 malformed, 2 query groups, 0s old
   traced      1 to a call site, 0 with no call site, 0 to no model at all
   benchmark   1 relation timed
 ```
@@ -95,10 +96,14 @@ Line by line:
 
 - `shop/views.py:6 catalogue()` — the queryset, the function it is in, and the
   relation being loaded. Paste the first part into your editor.
-- `rows 120 (observed)` — how many rows that queryset returned. `observed` means
-  it was counted in the recording. `estimated` means it came from a `COUNT(*)`
-  because there was no recording to count it in, and `static bound` means the
-  code caps it itself with a slice or a `get()`. The report always says which.
+- `rows 120 (observed) median of 12 calls` — how many rows that queryset
+  returned **in one call**, and how many calls that figure was taken over.
+  `observed` means it was counted in the recording. `estimated` means it came
+  from a `COUNT(*)` because there was no recording to count it in, and
+  `static bound` means the code caps it itself with a slice or a `get()`. The
+  report always says which. A number measured over `one call only` is weaker
+  evidence than one measured over twelve, so the reach is printed rather than
+  averaged away.
 - `current` / `best` / `alternative` — the query count and the time for each
   strategy, measured just now on your database over the same slice of rows.
   Query counts are deterministic; the milliseconds are not, which is exactly why
@@ -109,8 +114,14 @@ Line by line:
   function and the table. `probable` means only one of them matched.
 - `already fine` — sites there is nothing to do about. Touching only
   `book.publisher_id` never needs a hint: the column is already on the row.
-- `coverage` — what the run could and could not see. A report that hides what it
-  failed on reads like a clean bill of health for exactly the code it missed.
+- `coverage` — what the run could and could not see. Every queryset expression
+  in your source lands in exactly one of three buckets: `followed` into a call
+  site above, `terminal` because `values()` or `count()` leaves nothing to
+  hint, or `not followed` because the scanner could not trace it. That last
+  number is the backlog, and it is deliberately printed next to the other two
+  rather than divided into a percentage — a coverage figure whose denominator
+  excludes what it missed reads like a clean bill of health for exactly the
+  code it failed on.
 
 ## The two modes of the default report
 
@@ -210,8 +221,9 @@ python manage.py fk_optimize [app_label | app_label.ModelName] [options]
 | `--timeout SECONDS` | wall-clock budget for the whole run. Partial results are still printed, and the report says it was cut short. |
 | `--min-rows N` | ignore relations on tables with fewer rows than this. Default: 0. |
 | `--json [PATH]` | write the report as JSON. |
-| `--fail-on-findings` | exit 1 when any actionable verdict exists. |
-| `--include-django` | include Django's own and third-party apps. Off by default. |
+| `--fail-on-findings` | exit 1 when an actionable verdict has rows behind it. Findings on an empty table are printed but never fail a build; the count of those is reported on stderr. |
+| `--include-django` | include Django's own apps (`django.*`). Off by default. |
+| `--include-third-party` | include apps installed into site-packages — DRF, allauth, wagtail. Off by default: their querysets are not yours to change. An editable install is your code and is always scanned. |
 | `--django-models` | deprecated alias for `--include-django`. |
 
 Two things to know about `--json`:
@@ -221,6 +233,9 @@ Two things to know about `--json`:
   whole project. Write `fk_optimize shop --json`.
 - With no path it replaces the text report on stdout. With a path it writes the
   file **and** still prints the text report.
+- It does not combine with `--no-callsites`. The sweep times relations and
+  produces no verdicts, so there is nothing to serialise; the command says so
+  rather than exiting 0 having written nothing.
 
 The payload is `{schema_version, generated_at, verdicts: [...], coverage: {...}}`,
 one object per verdict with the model, relation, row count and its provenance,
@@ -261,16 +276,30 @@ CommandError: 1 actionable finding (--fail-on-findings)
 
 Run it after whatever produces your recording — a test suite wrapped in
 `record()` is the usual answer. Without one it still works, on estimated row
-counts. `--min-rows` is useful here to keep a fixture table of four rows from
-failing a build.
+counts.
+
+A finding on a table with no rows has nothing behind it, so it is printed and
+not counted: the gate fires on evidence, and how many findings it passed over
+is written to stderr rather than left to be discovered. `--min-rows` raises
+that bar further when a fixture table of four rows is still too little to
+believe.
+
+**Put the `record()` block inside the loop, not around it.** One block is one
+invocation, so a suite that exercises a view twelve times inside a single block
+reports one call of twelve times the work. Wrapped per test — or left to the
+middleware, where a request is already the boundary — N is the N of one call.
 
 ## How it works
 
 Three parts, and no one of them is enough on its own.
 
 - **The static scan** reads your source and finds which line iterates which
-  model and touches which relation, and which hints are already there. It cannot
-  know how many rows come back.
+  model and touches which relation, and which hints are already there. It
+  follows a chain as far as it goes, so `book.publisher.country` is reported as
+  the one path `publisher__country` rather than as its first hop, and it
+  resolves a queryset bound to a class attribute, returned by `get_queryset()`
+  or stashed on `self` — which is how a DRF ViewSet and most class-based views
+  are written. It cannot know how many rows come back.
 - **The recorder** knows exactly that, because it counted. Grouping the recorded
   queries by shape and by the line that caused them turns a repeated single-row
   lookup into an N+1 of a known size. It also sees the accesses that happen
@@ -289,10 +318,23 @@ relation's target table is the table the repeated query read.
 
 ## Limitations
 
-- **Verdicts cover forward many-to-one relations only.** Those are the ones
-  `select_related()` can join and the ones that produce the classic N+1. Reverse
-  and many-to-many relations are covered by `--no-callsites`, which times them
-  but cannot tell you where they are used.
+- **Verdicts cover forward many-to-one relations only**, at any depth along a
+  chain. Those are the ones `select_related()` can join and the ones that
+  produce the classic N+1. Reverse and many-to-many relations are covered by
+  `--no-callsites`, which times them but cannot tell you where they are used.
+- **The scanner resolves a queryset it can follow, and says so when it cannot.**
+  A queryset built in another module, handed to a callee, or stored in a dict is
+  counted under `not followed` in the coverage block rather than guessed at. That
+  number is usually the largest one in the report, and it is meant to be: it is
+  the backlog, not a rounding error.
+- **Under `--include-third-party`, one N+1 in an installed app can be reported
+  twice.** The recorder treats site-packages frames as library code, so it
+  blames the caller and files a runtime-only finding, while the static scan
+  finds the same relation at its real line. Nothing joins the two. It cannot
+  happen with the default flags, where installed apps are out of scope.
+- **One `record()` block is one invocation.** A request is already a boundary, so
+  the middleware needs no thought; a script or a test that loops needs the block
+  inside the loop, or N is reported as the whole loop's traffic.
 - **Static analysis cannot see a template or a serializer.** `{{ book.publisher.name }}`
   and a DRF `source=` field are attribute access inside library code; no AST
   scan will ever find them. That is precisely why the recorder exists, and with
