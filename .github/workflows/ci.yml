@@ -111,6 +111,11 @@ jobs:
   # backlog, not a regression. It is printed as the three-way split of
   # everything seen, because a percentage whose denominator leaves out the
   # misses answers the wrong question.
+  #
+  # Nor does it fail on somebody else's outage. A clone that 503s is retried
+  # and then passed over as unavailable, and only a run where every project was
+  # lost is failed -- a job that goes red for github's bad afternoon is a job
+  # people learn to scroll past, including on the day it is right.
   corpus:
     name: corpus
     runs-on: ubuntu-latest
@@ -151,7 +156,9 @@ jobs:
   #
   # Benchmarking is left on: a benchmark querying a table that does not exist
   # once took a whole run down with it, and only a real schema makes that shape.
-  # Floors, not exact counts, for the same reason `corpus` gives.
+  # Floors, not exact counts, for the same reason `corpus` gives -- and clones
+  # and installs are retried and then reported as unavailable, also for the
+  # reason `corpus` gives.
   live:
     name: live
     runs-on: ubuntu-latest

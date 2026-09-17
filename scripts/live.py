@@ -59,13 +59,19 @@ The workdir is never deleted. Clones and virtualenvs are the slow part of this
 by an order of magnitude, and a second run over the same directory reuses both.
 CI throws its runner away and does not care; locally, pass `--workdir`.
 
-Exit status is 0 when every project behaved, 1 when any did not.
+Exit status is 0 when every project behaved, 1 when any did not. A project
+whose clone or install never completed -- a git host answering 503, a wheel
+index timing out -- is retried, then reported as unavailable and passed over:
+it never got as far as saying anything about this code. The run fails only if
+that happened to every one of them, because a green tick on a run that
+exercised nothing is the one outcome worse than a red one.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -305,24 +311,62 @@ def must(done: subprocess.CompletedProcess, what: str) -> None:
         )
 
 
+class Unavailable(RuntimeError):
+    """A step that never got to say anything about this code.
+
+    A git host answering 503 and a wheel index timing out are not findings.
+    Reported apart from a crash and never allowed to fail the run, because a
+    job that goes red for somebody else's outage is a job people learn to
+    ignore -- and the one it cries wolf over is the traceback that mattered.
+    """
+
+
+# Three attempts because two is indistinguishable from bad luck, and a fourth
+# would buy a minute of runner time to learn what the third already said.
+ATTEMPTS = 3
+BACKOFF = (5, 20)
+
+
+def insist(command, what: str, cwd=None, timeout=1800, cleanup=None):
+    """Run a step that depends on the network, and give it more than one go."""
+    last = "no attempt was made"
+    for attempt in range(ATTEMPTS):
+        try:
+            done = run(command, cwd=cwd, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            last = f"{what} timed out after {timeout}s"
+        else:
+            if done.returncode == 0:
+                return done
+            last = f"{what} exited {done.returncode}\n{done.stdout}\n{done.stderr}"
+        # A half-finished clone leaves a directory behind that looks exactly
+        # like a finished one to the next caller, so the retry starts clean.
+        if cleanup is not None:
+            cleanup()
+        if attempt + 1 < ATTEMPTS:
+            pause = BACKOFF[min(attempt, len(BACKOFF) - 1)]
+            print(f"   {what} failed, retrying in {pause}s")
+            time.sleep(pause)
+    raise Unavailable(f"{what} gave up after {ATTEMPTS} attempts\n{last}")
+
+
 def clone(name: str, url: str, into: Path) -> Path:
     target = into / name
     if target.exists():
         return target
-    must(
-        run(
-            [
-                "git",
-                "clone",
-                "--depth",
-                "1",
-                "--filter=blob:none",
-                "--quiet",
-                url,
-                target,
-            ]
-        ),
+    insist(
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            "--quiet",
+            url,
+            target,
+        ],
         f"cloning {name}",
+        cleanup=lambda: shutil.rmtree(target, ignore_errors=True),
     )
     return target
 
@@ -337,14 +381,15 @@ def virtualenv(root: Path, source: Path, editable: bool) -> Path:
     python = root / "venv" / "bin" / "python"
     if not python.exists():
         must(run([sys.executable, "-m", "venv", root / "venv"]), "creating the venv")
-        must(run([python, "-m", "pip", "install", "-q", "--upgrade", "pip"]), "pip")
+        insist([python, "-m", "pip", "install", "-q", "--upgrade", "pip"], "pip")
     install = [python, "-m", "pip", "install", "-q"]
-    must(
-        run(install + (["-e"] if editable else []) + [source]), "installing the project"
-    )
+    # `insist`, not `must`: resolving somebody else's dependencies crosses the
+    # network exactly as the clone did, and fails the same way for the same
+    # reasons, none of which are ours.
+    insist(install + (["-e"] if editable else []) + [source], "installing the project")
     # Installed the same way a user would, from the tree rather than from an
     # editable link, so a module missing from the package is a failure here.
-    must(run(install + [REPO]), "installing django_fk_optimize")
+    insist(install + [REPO], "installing django_fk_optimize")
     return python
 
 
@@ -470,11 +515,17 @@ def main(argv=None) -> int:
     workdir.mkdir(parents=True, exist_ok=True)
     print(f"live workdir: {workdir}")
 
-    outcomes, crashed = [], []
+    outcomes, crashed, unavailable = [], [], []
     for name in options.only or list(PROJECTS):
         print(f"-- {name}")
         try:
             outcome = live(name, PROJECTS[name], workdir)
+        except Unavailable as exc:
+            # Never a traceback: the stack of a 503 is noise, and printing one
+            # makes an outage look like the crash this job exists to catch.
+            unavailable.append(name)
+            print(f"   unavailable: {exc}".replace("\n", "\n   "))
+            continue
         except Exception:
             # Installing and migrating somebody else's project is the fragile
             # part, so it is reported in full rather than summarised.
@@ -515,11 +566,21 @@ def main(argv=None) -> int:
         )
 
     print(f"\n{len(outcomes)} projects installed, migrated and reported on")
+    if unavailable:
+        print(f"UNAVAILABLE, not a regression: {', '.join(unavailable)}")
     if crashed:
         print(f"\nCRASHED: {', '.join(crashed)}")
     for outcome in outcomes:
         for problem in outcome.problems:
             print(f"REGRESSION: {outcome.name}: {problem}")
+
+    # One project lost to an outage leaves the other two still saying
+    # something. All of them lost says nothing at all, and a green tick on a
+    # run that exercised no project is the only outcome here worse than a red
+    # one, so that is the case this fails on.
+    if not outcomes and unavailable:
+        print("nothing ran: every project was unavailable")
+        return 1
     return 1 if crashed or any(o.problems for o in outcomes) else 0
 
 

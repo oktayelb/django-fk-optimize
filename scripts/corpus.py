@@ -11,7 +11,10 @@ and a few seconds of parsing, and any project can be added by one line.
 
 What it enforces, from `corpus-baseline.json`:
 
-* nothing raises -- an unhandled exception on any project fails the run;
+* nothing raises -- an unhandled exception on any project fails the run,
+  while a clone that never completed is retried, then reported as
+  unavailable and passed over: an outage at a git host says nothing about
+  this scanner, and the run fails on that only if every project was lost;
 * parse failures stay at or below the recorded allowance, and are printed with
   the parser's own message beside them: a file that will not parse is as often
   newer than the interpreter reading it as it is broken, and the count alone
@@ -45,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -71,25 +75,49 @@ PROJECTS = {
 }
 
 
+class Unavailable(RuntimeError):
+    """A clone that never happened, so the project never said anything.
+
+    Kept apart from a crash on purpose. A git host answering 503 is not a
+    regression in a scanner, and a job that goes red for it is a job people
+    learn to scroll past -- including on the day it is right.
+    """
+
+
+# Three attempts: two is indistinguishable from bad luck, and a fourth costs a
+# minute of runner time to learn what the third already said.
+ATTEMPTS = 3
+BACKOFF = (5, 20)
+
+
 def clone(name: str, url: str, into: Path) -> Path:
     target = into / name
     if target.exists():
         return target
-    subprocess.run(
-        [
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            "--filter=blob:none",
-            "--quiet",
-            url,
-            str(target),
-        ],
-        check=True,
-        timeout=600,
-    )
-    return target
+    command = [
+        "git",
+        "clone",
+        "--depth",
+        "1",
+        "--filter=blob:none",
+        "--quiet",
+        url,
+        str(target),
+    ]
+    last = "no attempt was made"
+    for attempt in range(ATTEMPTS):
+        done = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        if done.returncode == 0:
+            return target
+        last = f"exited {done.returncode}\n{done.stderr.strip()}"
+        # A half-finished clone leaves behind a directory that looks finished
+        # to the next caller, so each retry starts from nothing.
+        shutil.rmtree(target, ignore_errors=True)
+        if attempt + 1 < ATTEMPTS:
+            pause = BACKOFF[min(attempt, len(BACKOFF) - 1)]
+            print(f"   cloning {name} failed, retrying in {pause}s")
+            time.sleep(pause)
+    raise Unavailable(f"cloning {name} gave up after {ATTEMPTS} attempts\n{last}")
 
 
 def revision(path: Path) -> str:
@@ -235,7 +263,7 @@ def main(argv=None) -> int:
     if BASELINE.exists():
         baseline = json.loads(BASELINE.read_text())
 
-    results, problems, crashed = {}, [], []
+    results, problems, crashed, unavailable = {}, [], [], []
     for name in names:
         url = PROJECTS.get(name)
         if url is None:
@@ -245,6 +273,12 @@ def main(argv=None) -> int:
         try:
             path = clone(name, url, root)
             results[name] = analyse(path)
+        except Unavailable as exc:
+            # No traceback: the stack of a 503 is noise, and printing one makes
+            # an outage read like the crash this job exists to catch.
+            unavailable.append(name)
+            print(f"   unavailable: {exc}".replace("\n", "\n   "))
+            continue
         except Exception:
             # A crash is the one thing this job exists to catch, so it is
             # reported in full and never swallowed.
@@ -294,10 +328,18 @@ def main(argv=None) -> int:
         }
         print(f"coverage: {census(totals)}")
 
+    if unavailable:
+        print(f"UNAVAILABLE, not a regression: {', '.join(unavailable)}")
     if crashed:
         print(f"\nCRASHED: {', '.join(crashed)}")
     for problem in problems:
         print(f"REGRESSION: {problem}")
+
+    # Seven projects still say plenty; none of them says nothing, and a green
+    # tick on a run that scanned nothing is worse than a red one.
+    if not results and unavailable:
+        print("nothing ran: every project was unavailable")
+        return 1
     return 1 if crashed or problems else 0
 
 
