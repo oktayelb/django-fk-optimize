@@ -134,6 +134,40 @@ jobs:
           path: corpus-report.json
           if-no-files-found: warn
 
+  # `corpus` never imports a project, so a third of this package is all it can
+  # reach: the AST scanner and a vocabulary parsed out of models.py. This job
+  # pays for the other two thirds. It installs three real projects into throwaway
+  # virtualenvs, writes a minimal settings module, migrates sqlite, and runs
+  # `manage.py fk_optimize --json` against the project's own app registry --
+  # `Vocabulary.from_apps`, the join, the verdict engine, the benchmark and the
+  # renderer, none of which any other job puts in front of models nobody here
+  # wrote. Three projects rather than eight, because installing one costs a
+  # virtualenv and the whole point of `corpus` is that it does not.
+  #
+  # Benchmarking is left on: a benchmark querying a table that does not exist
+  # once took a whole run down with it, and only a real schema makes that shape.
+  # Floors, not exact counts, for the same reason `corpus` gives.
+  live:
+    name: live
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install, migrate and report on real projects
+        run: python scripts/live.py --json live-report.json
+
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-report
+          path: live-report.json
+          if-no-files-found: warn
+
   lint:
     name: lint
     runs-on: ubuntu-latest
