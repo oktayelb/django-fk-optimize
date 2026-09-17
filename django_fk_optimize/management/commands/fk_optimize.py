@@ -358,6 +358,14 @@ class Command(BaseCommand):
             sites_probable=sum(1 for site in scan.sites if site.confidence == PROBABLE),
             sites_unresolved=len(scan.unresolved),
             scan_errors=len(scan.errors),
+            # The scanner's census, passed through as it was taken: every
+            # manager expression it met, and the two ways one can be accounted
+            # for without becoming a call site. Counted per expression, not
+            # per site, so that `seen == attributed + terminal + unresolved`
+            # still holds by the time it is printed.
+            sites_seen=scan.seen,
+            sites_terminal=scan.terminal,
+            sites_attributed=scan.attributed,
             recording_path=str(path),
             recording_exists=recording.exists,
             records=recording.count,

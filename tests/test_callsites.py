@@ -920,6 +920,162 @@ def test_an_unpacked_call_binds_nothing(vocabulary):
     assert report.sites == []
 
 
+# -- the census --------------------------------------------------------
+#
+# The coverage figure is only worth printing if its denominator is every
+# queryset in the file rather than the ones the scan happened to look at.
+# A shape nobody has taught the scanner yet has to make the number worse.
+
+CENSUS = {
+    "iterated": "for book in Book.objects.all():\n    print(book.publisher.name)\n",
+    "assigned then iterated": (
+        "books = Book.objects.all()\nfor book in books:\n    print(book.author.name)\n"
+    ),
+    "terminal": "Book.objects.filter(title='x').delete()\n",
+    "counted": "total = Book.objects.count()\n",
+    "created": "Book.objects.create(title='x')\n",
+    "unfollowable": "for book in registry.objects.all():\n    print(book.publisher)\n",
+    "handed to a callee": "render(Book.objects.all())\n",
+    "wrapped in a call": (
+        "for book in list(Book.objects.all()):\n    print(book.publisher.name)\n"
+    ),
+    "class attribute": (
+        "class View:\n"
+        "    queryset = Book.objects.all()\n"
+        "\n"
+        "    def listing(self):\n"
+        "        for book in self.queryset:\n"
+        "            print(book.publisher.name)\n"
+    ),
+    "method return": (
+        "class View:\n"
+        "    def get_queryset(self):\n"
+        "        return Book.objects.all()\n"
+        "\n"
+        "    def listing(self):\n"
+        "        for book in self.get_queryset():\n"
+        "            print(book.publisher.name)\n"
+    ),
+    "a manager on a name we cannot read": (
+        "for row in self.model.objects.all():\n    print(row.publisher)\n"
+    ),
+    "comprehension": "names = [b.publisher.name for b in Book.objects.all()]\n",
+    "nothing at all": "print('hello')\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(CENSUS))
+def test_every_manager_expression_lands_in_exactly_one_bucket(vocabulary, name):
+    report = scan(vocabulary, CENSUS[name])
+
+    assert report.seen == report.attributed + report.terminal + len(
+        report.unresolved
+    ), (
+        f"{name}: {report.seen} seen, {report.attributed} sites, "
+        f"{report.terminal} terminal, {report.unresolved}"
+    )
+
+
+def test_a_chain_is_counted_once_at_its_outermost_node(vocabulary):
+    """`Book.objects`, `.filter(...)` and `.select_related(...)` are one
+    expression, not the three nested ones the tree offers."""
+    report = scan(
+        vocabulary,
+        "for book in Book.objects.filter(title='x').select_related('author')[:5]:\n"
+        "    print(book.author.name)\n",
+    )
+
+    assert report.seen == 1
+    assert report.attributed == 1
+
+
+def test_a_queryset_that_is_understood_and_finished_is_not_backlog(vocabulary):
+    report = scan(
+        vocabulary,
+        "Book.objects.filter(title='x').update(title='y')\n"
+        "print(Book.objects.count())\n",
+    )
+
+    assert (report.seen, report.terminal) == (2, 2)
+    assert report.unresolved == []
+
+
+def test_one_queryset_iterated_twice_is_one_expression(vocabulary):
+    report = scan(
+        vocabulary,
+        "books = Book.objects.all()\n"
+        "for book in books:\n"
+        "    print(book.publisher.name)\n"
+        "for book in books:\n"
+        "    print(book.author.name)\n",
+    )
+
+    assert len(report.sites) == 2
+    assert (report.seen, report.attributed) == (1, 1)
+    assert report.unresolved == []
+
+
+def test_a_queryset_nobody_consumes_here_is_backlog_not_coverage(vocabulary):
+    """Handed to a template or a callee, it may well be an N+1 nobody sees."""
+    report = scan(vocabulary, "context = {'books': Book.objects.all()}\n")
+
+    assert report.sites == []
+    assert (report.seen, report.terminal) == (1, 0)
+    assert len(report.unresolved) == 1
+
+
+def test_a_manager_on_a_name_we_cannot_read_is_counted_too(vocabulary):
+    """`self.model.objects` is a manager being used; the only thing missing is
+    the one fact that would make it a call site."""
+    report = scan(
+        vocabulary,
+        "for row in self.model.objects.all():\n    print(row.publisher)\n",
+    )
+
+    assert report.seen == 1
+    assert len(report.unresolved) == 1
+
+
+def test_an_attribute_that_merely_reads_like_a_manager_is_not_counted(
+    vocabulary,
+):
+    """The first version of this matched the text of the expression, and
+    ".objects" is in "self.objects_list" too."""
+    report = scan(
+        vocabulary,
+        "for row in self.objects_list:\n    print(row.publisher)\n",
+    )
+
+    assert report.seen == 0
+    assert report.unresolved == []
+
+
+def test_a_queryset_inside_a_call_is_one_queryset(vocabulary):
+    report = scan(
+        vocabulary,
+        "for book in list(Book.objects.all()):\n    print(book.publisher.name)\n",
+    )
+
+    assert report.seen == 1
+    assert len(report.unresolved) == 1, "the list() is what we cannot follow"
+
+
+def test_the_census_adds_up_across_files(tmp_path, vocabulary):
+    from django_fk_optimize.utils import scan_files
+
+    first = tmp_path / "a.py"
+    first.write_text(HEADER + "Book.objects.all().delete()\n")
+    second = tmp_path / "b.py"
+    second.write_text(
+        HEADER + "for book in Book.objects.all():\n    print(book.publisher.name)\n"
+    )
+
+    report = scan_files([first, second], vocabulary)
+
+    assert (report.seen, report.attributed, report.terminal) == (2, 1, 1)
+    assert report.unresolved == []
+
+
 def test_assigning_a_relation_is_not_touching_it(vocabulary):
     """Setting an FK issues no query; it is how people *avoid* one.
 

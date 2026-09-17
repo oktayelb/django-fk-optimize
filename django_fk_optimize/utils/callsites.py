@@ -143,6 +143,10 @@ class Binding:
     confidence: str = RESOLVED
     notes: tuple[str, ...] = ()
     origin: str = ""  # the chain this started as, for a name that hides it
+    # id() of the manager expression this chain grew out of, so a site found
+    # three scopes away can still be counted against the queryset that built
+    # it.  Zero when the chain has no manager expression in this file.
+    origin_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -254,6 +258,19 @@ class ScanReport:
     only what it understood reads as a clean bill of health for the files it
     failed on, which is the one failure mode that makes a tool like this worse
     than nothing.
+
+    `seen`, `attributed`, `terminal` and `unresolved` are a census, not a
+    sample: every manager expression in the file lands in exactly one of the
+    last three, and
+
+        seen == attributed + terminal + len(unresolved)
+
+    holds per file and therefore over any number of files.  Without that
+    invariant the coverage figure is computed from a denominator made of the
+    cases the scanner happened to look at, which is how a project where four
+    queryset expressions out of a hundred and ninety-one became call sites
+    reported 97.7% coverage.  A shape nobody has taught the scanner yet is
+    supposed to make the number *worse*.
     """
 
     sites: list[CallSite] = dataclass_field(default_factory=list)
@@ -261,11 +278,24 @@ class ScanReport:
     errors: list[tuple[str, str]] = dataclass_field(default_factory=list)
     files: int = 0
 
+    # Every manager expression in the file, counted once at its outermost node.
+    seen: int = 0
+    # Those that produced at least one call site.  Expressions rather than
+    # sites: one queryset iterated in two places is one expression understood,
+    # and counting it twice would break the census it is part of.
+    attributed: int = 0
+    # Those that end in values(), count(), create(), ... -- understood, and
+    # with nothing a hint could improve.
+    terminal: int = 0
+
     def extend(self, other: ScanReport):
         self.sites.extend(other.sites)
         self.unresolved.extend(other.unresolved)
         self.errors.extend(other.errors)
         self.files += other.files
+        self.seen += other.seen
+        self.attributed += other.attributed
+        self.terminal += other.terminal
 
 
 # ----------------------------------------------------------------------
@@ -284,6 +314,9 @@ def scan_source(source, path, vocabulary, package=None) -> ScanReport:
     scanner.run()
     report.sites.extend(scanner.sites)
     report.unresolved.extend(scanner.unresolved)
+    report.seen = scanner.seen
+    report.attributed = scanner.attributed
+    report.terminal = scanner.terminal
     return report
 
 
@@ -329,6 +362,13 @@ class _Scanner:
         # ("call", "get_queryset") for `self.get_queryset()`.  Empty outside a
         # class body, and saved and restored around each one.
         self._attributes: dict[tuple[str, str], Binding] = {}
+        self._parents: dict[int, ast.AST] = {}
+        # The census (see ScanReport): every manager expression in the file,
+        # then the ids of the ones that turned into a site.
+        self._expressions: dict[int, ast.AST] = {}
+        self._unknown: dict[int, ast.AST] = {}
+        self._from_expression: set[int] = set()
+        self._terminal: set[int] = set()
         self._loaded_models()
 
     def _loaded_models(self):
@@ -369,7 +409,126 @@ class _Scanner:
         return self.vocabulary.by_label_parts(app, name)
 
     def run(self):
+        self._parents = _parents([self.tree])
+        self._census()
         self._scope_of(self.tree.body, {}, _module_scope(self.tree))
+        self._account()
+
+    # -- the census ----------------------------------------------------
+
+    @property
+    def seen(self) -> int:
+        return len(self._expressions) + len(self._unknown)
+
+    @property
+    def attributed(self) -> int:
+        return len(self._from_expression)
+
+    @property
+    def terminal(self) -> int:
+        return len(self._terminal)
+
+    def _census(self):
+        """Every manager expression in the file, before anything is resolved.
+
+        Taken up front and from the whole tree, because the point of the number
+        is to be independent of what the rest of the scan manages to follow:
+        counting only the expressions the walk reached would make the
+        denominator grow every time the scanner learns a new shape, which is
+        exactly backwards.
+
+        Counted at the outermost node of each chain, so
+        `Book.objects.filter(x).select_related(y)` is one expression and not
+        the three nested ones ast.walk() offers.
+
+        A chain that goes through a manager whose *model* cannot be named --
+        `permission_model.objects.filter(...)`, or a model this vocabulary
+        never learned -- is counted too, in `_unknown`.  It is not rooted in
+        anything we know, so it can never become a site, and a denominator that
+        leaves out the expressions the scan is worst at is a denominator that
+        flatters the scan.
+        """
+        for node in ast.walk(self.tree):
+            if not isinstance(node, (ast.Attribute, ast.Call, ast.Subscript)):
+                continue
+            if _extends(self._parents.get(id(node)), node):
+                continue
+            if self._manager_rooted(node):
+                self._expressions[id(node)] = node
+            elif self._manager_shaped(node):
+                self._unknown[id(node)] = node
+
+    def _manager_rooted(self, node) -> bool:
+        """A chain whose base is a model we know and whose first step is one of
+        its managers -- `Book.objects...`, and nothing looser."""
+        base, steps = _unwind(node)
+        if not isinstance(base, ast.Name) or not steps:
+            return False
+        kind, name, _step = steps[0]
+        if kind != "attr":
+            return False
+        info = self._model_from_name(base.id)
+        return info is not None and name in info.managers
+
+    def _manager_shaped(self, node) -> bool:
+        """A chain that reads a manager off something this scan cannot name.
+
+        `registry.objects.all()`, `self.model.objects.filter(...)`, a model the
+        vocabulary never learned: a manager is plainly being used, and the only
+        thing missing is the one fact that would make it a call site.  That is
+        the definition of a case the scanner does not handle yet, so it belongs
+        in the backlog rather than outside the count.
+
+        Read off the syntax tree rather than the text of the expression, which
+        the first version of this did: ".objects" is in "self.objects_list"
+        too.
+        """
+        _base, steps = _unwind(node)
+        return any(
+            kind == "attr" and name in self._managers for kind, name, _step in steps
+        )
+
+    def _outermost(self, node):
+        """The whole chain `node` is part of, for crediting a site to it."""
+        current = node
+        while True:
+            parent = self._parents.get(id(current))
+            if not _extends(parent, current):
+                return current
+            current = parent
+
+    def _credit(self, binding):
+        """Mark the manager expression a site grew out of as accounted for."""
+        if binding.origin_id in self._expressions:
+            self._from_expression.add(binding.origin_id)
+
+    def _account(self):
+        """Put every manager expression that is not a site in a bucket.
+
+        Re-resolved here rather than remembered during the walk, because most
+        manager expressions are never resolved at all: `Book.objects.filter(
+        ...).delete()` is a bare statement, and a scan that only classifies
+        what it iterated would file every write in the project under "could not
+        follow".  The chains this asks about are rooted in a model name, so the
+        answer does not depend on the scope they were written in.
+        """
+        leftover = []
+        for key, node in self._expressions.items():
+            if key in self._from_expression:
+                continue
+            if self._resolve(node, {}) is TERMINAL_CHAIN:
+                self._terminal.add(key)
+            else:
+                # Resolved but never consumed here counts as backlog too: a
+                # queryset handed to a template or a callee may well be an N+1
+                # this scan cannot see, and calling it understood would be the
+                # comfortable answer rather than the true one.
+                leftover.append(node)
+        leftover.extend(self._unknown.values())
+        for node in sorted(leftover, key=lambda item: getattr(item, "lineno", 0)):
+            self.unresolved.append(
+                (self.path, getattr(node, "lineno", 0), _source(node))
+            )
 
     # -- scopes --------------------------------------------------------
 
@@ -395,6 +554,7 @@ class _Scanner:
             )
             if not (touched or reached.free or reached.bypassed) and not escapes:
                 continue
+            self._credit(binding)
             self.sites.append(
                 CallSite(
                     path=self.path,
@@ -561,7 +721,7 @@ class _Scanner:
         if binding is TERMINAL_CHAIN:
             return
         if binding is None:
-            self._maybe_unresolved(node.iter)
+            # The census has already counted it; there is nothing to record.
             return
         if binding.kind == INSTANCE:
             return
@@ -576,7 +736,6 @@ class _Scanner:
             if binding is TERMINAL_CHAIN:
                 continue
             if binding is None:
-                self._maybe_unresolved(generator.iter)
                 continue
             if binding.kind == INSTANCE or not isinstance(generator.target, ast.Name):
                 continue
@@ -605,6 +764,7 @@ class _Scanner:
         if escapes:
             confidence = PROBABLE
             notes = notes + ("row escapes into a call; touches may be elsewhere",)
+        self._credit(binding)
         self.sites.append(
             CallSite(
                 path=self.path,
@@ -627,12 +787,6 @@ class _Scanner:
                 scope_end=scope_info.end,
             )
         )
-
-    def _maybe_unresolved(self, node):
-        """Record a loop that looked like a queryset but would not resolve."""
-        text = _source(node)
-        if any(f".{name}" in text for name in self._managers):
-            self.unresolved.append((self.path, getattr(node, "lineno", 0), text))
 
     # -- resolution ----------------------------------------------------
 
@@ -674,7 +828,12 @@ class _Scanner:
                 return None
             if not steps or steps[0][0] != "attr" or steps[0][1] not in info.managers:
                 return None
-            binding = Binding(kind=ITERATION, model=info, origin=_source(node))
+            binding = Binding(
+                kind=ITERATION,
+                model=info,
+                origin=_source(node),
+                origin_id=id(self._outermost(node)),
+            )
             index = 1
 
         for kind, name, step in steps[index:]:
@@ -728,6 +887,19 @@ SELF_NAMES = frozenset({"self", "cls"})
 def _overlaps(one: str, other: str) -> bool:
     """Whether two relation paths meet -- same path, or one inside the other."""
     return one == other or one.startswith(other + "__") or other.startswith(one + "__")
+
+
+def _extends(parent, node) -> bool:
+    """Whether `parent` carries the chain `node` is part of one step further.
+
+    `Book.objects` inside `Book.objects.all()` is not an expression of its own;
+    it is the middle of one.  This is how the census counts a chain once.
+    """
+    return (
+        (isinstance(parent, ast.Attribute) and parent.value is node)
+        or (isinstance(parent, ast.Call) and parent.func is node)
+        or (isinstance(parent, ast.Subscript) and parent.value is node)
+    )
 
 
 def _paired(target, value):

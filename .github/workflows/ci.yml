@@ -105,9 +105,12 @@ jobs:
   # live. No database and no `pip install` of the project -- the vocabulary is
   # read out of source -- so it costs a shallow clone and a few seconds each.
   #
-  # It fails on a crash or on a floor being breached. It never fails on
-  # `sites_unresolved`: a queryset the scanner could not follow is a case we do
-  # not handle yet, and that number is a backlog, not a regression.
+  # It fails on a crash, on a floor being breached, or on the expression census
+  # not adding up. It never fails on coverage itself: a queryset the scanner
+  # could not follow is a case we do not handle yet, and that number is a
+  # backlog, not a regression. It is printed as the three-way split of
+  # everything seen, because a percentage whose denominator leaves out the
+  # misses answers the wrong question.
   corpus:
     name: corpus
     runs-on: ubuntu-latest

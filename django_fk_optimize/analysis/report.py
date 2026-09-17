@@ -62,6 +62,24 @@ class Coverage:
     sites_unresolved: int = 0
     scan_errors: int = 0
 
+    # The census the scanner takes of every manager-rooted expression it meets:
+    # `seen` is all of them, and each one lands in exactly one of `attributed`
+    # (it produced a call site), `sites_terminal` (it ends in values()/count()/
+    # create()/... and there is nothing to hint) and `sites_unresolved`.
+    #
+    # Printed as the three-way split rather than as a percentage of the part
+    # that worked.  A denominator that leaves out what the scanner missed
+    # answers "of the expressions I understood, how many did I understand?" --
+    # which is how a project where four expressions out of a hundred and ninety
+    # resolved got told its coverage was 97.7%.
+    #
+    # Defaulted, so the command can populate them in its own time and this
+    # block stays correct meanwhile: nobody took a census is a different state
+    # from a census that came back empty, and zero `seen` is read as the first.
+    sites_seen: int = 0
+    sites_terminal: int = 0
+    sites_attributed: int = 0
+
     recording_path: str = ""
     recording_exists: bool = False
     records: int = 0
@@ -285,6 +303,58 @@ def _one_liner(verdict: Verdict) -> tuple[str, str]:
     return (f"  {pad(where, 34)}  {pad(verdict.target, 26)}  {verdict.headline}", PLAIN)
 
 
+def _census(coverage: Coverage) -> list[tuple[str, str]]:
+    """What the scanner met, and what it did with each of it.
+
+    The three-way split is the honest shape of this number.  "2 querysets the
+    scanner could not follow" is true and says nothing, because it never says
+    two out of what; a reader takes it for a rounding error next to a report
+    full of findings, and the hundred and eighty-five expressions nobody has
+    taught the scanner yet go unmentioned.  Seen against `seen`, the same two
+    are either a rounding error or the whole story, and the reader can tell
+    which.
+
+    Falls back to the old line while `seen` is zero, which means the caller has
+    not counted rather than that there was nothing to count.
+    """
+    if not coverage.sites_seen:
+        return [
+            _row(
+                "not seen",
+                f"{plural(coverage.sites_unresolved, 'queryset')} "
+                "the scanner could not follow, "
+                f"{plural(coverage.scan_errors, 'file')} it could not parse",
+            )
+        ]
+
+    lines = [
+        _row(
+            "querysets",
+            f"{plural(coverage.sites_seen, 'expression')} seen: "
+            f"{coverage.sites_attributed} followed, "
+            f"{coverage.sites_terminal} terminal, "
+            f"{coverage.sites_unresolved} not followed",
+        ),
+        _row("not seen", f"{plural(coverage.scan_errors, 'file')} it could not parse"),
+    ]
+    accounted = (
+        coverage.sites_attributed + coverage.sites_terminal + coverage.sites_unresolved
+    )
+    if accounted != coverage.sites_seen:
+        # The census is the one number here that can be checked against itself,
+        # so it is -- loudly.  A split that does not add up means expressions
+        # are falling out of the count somewhere, and a coverage figure built
+        # on a leaking denominator is worth less than no figure at all.
+        lines.append(
+            (
+                f"  the census does not add up: {coverage.sites_seen} seen, "
+                f"{accounted} accounted for",
+                WARNING,
+            )
+        )
+    return lines
+
+
 def _coverage(coverage: Coverage) -> list[tuple[str, str]]:
     lines: list[tuple[str, str]] = [("", PLAIN), ("coverage", HEADING)]
     if coverage.scanned:
@@ -298,12 +368,7 @@ def _coverage(coverage: Coverage) -> list[tuple[str, str]]:
                 f"{coverage.sites_probable} probable)",
             )
         )
-        unseen = (
-            f"{plural(coverage.sites_unresolved, 'queryset')} "
-            "the scanner could not follow, "
-            f"{plural(coverage.scan_errors, 'file')} it could not parse"
-        )
-        lines.append(_row("not seen", unseen))
+        lines.extend(_census(coverage))
     else:
         lines.append(_row("scanned", "nothing (--no-callsites)"))
 

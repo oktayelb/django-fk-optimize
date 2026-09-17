@@ -431,3 +431,60 @@ def test_json_carries_the_reach_of_the_observation():
         "seconds": 0.3402,
         "invocations": 37,
     }
+
+
+# ----------------------------------------------------------------------
+# the census
+# ----------------------------------------------------------------------
+
+
+def test_the_backlog_is_printed_against_what_it_is_a_backlog_of():
+    """ "2 could not be followed" out of what? The denominator is the finding.
+
+    The old line named the failures and never the total, so a project where
+    four expressions out of a hundred and ninety resolved read like a project
+    with four small gaps.
+    """
+    coverage = report.Coverage(
+        sites_seen=190,
+        sites_attributed=4,
+        sites_terminal=1,
+        sites_unresolved=185,
+        scan_errors=0,
+    )
+
+    text = text_of([], coverage)
+
+    assert "190 expressions seen: 4 followed, 1 terminal, 185 not followed" in text
+
+
+def test_a_census_that_does_not_add_up_says_so():
+    """The one number here that can be checked against itself, checked."""
+    coverage = report.Coverage(
+        sites_seen=190,
+        sites_attributed=4,
+        sites_terminal=1,
+        sites_unresolved=180,
+    )
+
+    lines = report.render_text([], coverage)
+    warnings = [line for line, style in lines if style == report.WARNING]
+
+    assert any(
+        "does not add up: 190 seen, 185 accounted for" in line for line in warnings
+    )
+
+
+def test_no_census_is_not_an_empty_census():
+    """While the command has not been taught to count, the old line stands.
+
+    Zero expressions seen would otherwise render as "0 seen: 0 followed" beside
+    a report full of findings, which is a worse lie than the one being fixed.
+    """
+    coverage = report.Coverage(sites_unresolved=2, scan_errors=1)
+
+    text = text_of([], coverage)
+
+    assert "2 querysets the scanner could not follow" in text
+    assert "1 file it could not parse" in text
+    assert "expressions seen" not in text

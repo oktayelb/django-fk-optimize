@@ -13,16 +13,29 @@ What it enforces, from `corpus-baseline.json`:
 
 * nothing raises -- an unhandled exception on any project fails the run;
 * parse failures stay at or below the recorded allowance;
-* models and call sites stay at or above the recorded floors, so a scanner
-  that quietly stops resolving anything cannot pass.
+* models, call sites and followed expressions stay at or above the recorded
+  floors, so a scanner that quietly stops resolving anything cannot pass;
+* the census adds up -- every manager expression the scanner met is either
+  followed, terminal or not followed, and a project where those three do not
+  sum to `seen` is a bug in the bookkeeping, not a shortfall in coverage.
 
 Floors rather than exact counts, because these projects keep moving and a
 pinned expectation would fail for their reasons rather than ours.
 
-`sites_unresolved` is reported and never failed on. It is the honest coverage
-metric: a queryset the scanner could not follow is a case we do not handle
-yet, and the number going up on a new project is a backlog item, not a
-regression.
+Coverage is printed as that three-way split and never failed on. It used to be
+printed as `sites / (sites + unresolved)`, a denominator made of the cases the
+scanner happened to understand, which told django-machina it had 97.7% coverage
+of a project where four expressions out of a hundred and ninety resolved. A
+shape nobody has taught the scanner yet is supposed to make the number worse,
+so the denominator is now everything seen.
+
+The low figures are not all scanner failures. Much of django-machina's
+unresolved count is its dynamically generated models, which the vocabulary
+`from_tree` reads out of source cannot see at all -- a limit of this script's
+AST-only vocabulary, not of the scanner, which would resolve them perfectly
+well given the app registry. Reading the registry needs the project installed
+and configured, which is what `scripts/live.py` does for a couple of projects
+and what this deliberately does not do for eight.
 """
 
 from __future__ import annotations
@@ -91,20 +104,18 @@ def revision(path: Path) -> str:
 
 def analyse(path: Path) -> dict:
     """Everything the scanner can say about one project, without running it."""
-    from django_fk_optimize.utils.callsites import PROBABLE, RESOLVED, scan_file
+    from django_fk_optimize.utils.callsites import PROBABLE, RESOLVED, scan_files
     from django_fk_optimize.utils.sources import python_files
     from django_fk_optimize.utils.static_vocabulary import from_tree
 
     started = time.perf_counter()
     vocabulary, stats = from_tree(path)
 
-    sites, unresolved, errors, files = [], 0, 0, 0
-    for source in python_files(path):
-        files += 1
-        report = scan_file(source, vocabulary)
-        sites.extend(report.sites)
-        unresolved += len(report.unresolved)
-        errors += len(report.errors)
+    # `scan_files` rather than a loop of `scan_file`: the accumulation of the
+    # census across files is the product's own, so this measures it instead of
+    # reimplementing it and agreeing with itself.
+    scanned = scan_files(python_files(path), vocabulary)
+    sites = scanned.sites
 
     touched = sum(len(site.touched) for site in sites)
     return {
@@ -115,12 +126,17 @@ def analyse(path: Path) -> dict:
         "relations": stats.relations,
         "unresolved_targets": len(stats.unresolved_targets),
         "model_parse_errors": len(stats.errors),
-        "files": files,
-        "parse_errors": errors,
+        "files": scanned.files,
+        "parse_errors": len(scanned.errors),
         "sites": len(sites),
         "sites_resolved": sum(1 for s in sites if s.confidence == RESOLVED),
         "sites_probable": sum(1 for s in sites if s.confidence == PROBABLE),
-        "sites_unresolved": unresolved,
+        # The census: every manager-rooted expression lands in exactly one of
+        # the last three, and `sites_seen` is all of them.
+        "sites_seen": scanned.seen,
+        "sites_attributed": scanned.attributed,
+        "sites_terminal": scanned.terminal,
+        "sites_unresolved": len(scanned.unresolved),
         "touches": touched,
         "with_hints": sum(1 for s in sites if s.hints),
         "missing_hints": sum(1 for s in sites if s.missing),
@@ -132,7 +148,7 @@ def analyse(path: Path) -> dict:
 
 def check(name: str, result: dict, floors: dict) -> list[str]:
     problems = []
-    for key in ("models", "sites"):
+    for key in ("models", "sites", "sites_attributed"):
         floor = floors.get(key)
         if floor is not None and result[key] < floor:
             problems.append(f"{name}: {key} fell to {result[key]}, floor is {floor}")
@@ -142,7 +158,29 @@ def check(name: str, result: dict, floors: dict) -> list[str]:
             problems.append(
                 f"{name}: {key} rose to {result[key]}, allowance is {allowed}"
             )
+    # Not a floor and not a matter of degree. The three buckets partition the
+    # expressions the scanner met, so if they do not sum to `seen` the census
+    # is miscounting and every coverage figure taken from it is fiction.
+    parts = result["sites_attributed"] + result["sites_terminal"]
+    parts += result["sites_unresolved"]
+    if parts != result["sites_seen"]:
+        problems.append(
+            f"{name}: census does not add up -- {result['sites_seen']} seen but "
+            f"{result['sites_attributed']} + {result['sites_terminal']} + "
+            f"{result['sites_unresolved']} = {parts}"
+        )
     return problems
+
+
+def census(result: dict) -> str:
+    """The three-way split, as a share of everything the scanner met."""
+    seen = result["sites_seen"]
+    share = f"{result['sites_attributed'] / seen:.1%}" if seen else "n/a"
+    return (
+        f"{result['sites_attributed']}/{seen} expressions followed ({share}), "
+        f"{result['sites_terminal']} terminal, "
+        f"{result['sites_unresolved']} not followed"
+    )
 
 
 def main(argv=None) -> int:
@@ -186,9 +224,9 @@ def main(argv=None) -> int:
         print(
             f"   {result['models']:>5} models  {result['sites']:>5} sites  "
             f"({result['sites_resolved']} resolved, {result['sites_probable']} probable)  "
-            f"{result['sites_unresolved']:>4} not followed  "
             f"{result['parse_errors']} parse errors  {result['seconds']}s"
         )
+        print(f"   {census(result)}")
         problems.extend(check(name, result, baseline.get(name, {})))
 
     if options.write_baseline:
@@ -198,6 +236,7 @@ def main(argv=None) -> int:
                 # set to today's exact number fails for their reasons.
                 "models": int(r["models"] * 0.8),
                 "sites": int(r["sites"] * 0.8),
+                "sites_attributed": int(r["sites_attributed"] * 0.8),
                 "parse_errors": r["parse_errors"],
                 "model_parse_errors": r["model_parse_errors"],
             }
@@ -210,15 +249,18 @@ def main(argv=None) -> int:
         Path(options.json).write_text(json.dumps(results, indent=2, sort_keys=True))
 
     total_sites = sum(r["sites"] for r in results.values())
-    total_unresolved = sum(r["sites_unresolved"] for r in results.values())
-    print(
-        f"\n{len(results)} projects, {total_sites} call sites, "
-        f"{total_unresolved} querysets not followed"
-    )
-    if total_sites:
-        print(
-            f"coverage: {1 - total_unresolved / (total_sites + total_unresolved):.1%}"
-        )
+    print(f"\n{len(results)} projects, {total_sites} call sites")
+    if results:
+        totals = {
+            key: sum(r[key] for r in results.values())
+            for key in (
+                "sites_seen",
+                "sites_attributed",
+                "sites_terminal",
+                "sites_unresolved",
+            )
+        }
+        print(f"coverage: {census(totals)}")
 
     if crashed:
         print(f"\nCRASHED: {', '.join(crashed)}")

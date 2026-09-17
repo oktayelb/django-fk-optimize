@@ -3,48 +3,56 @@
     "model_parse_errors": 0,
     "models": 22,
     "parse_errors": 0,
-    "sites": 30
+    "sites": 30,
+    "sites_attributed": 29
   },
   "django-cms": {
     "model_parse_errors": 0,
     "models": 150,
     "parse_errors": 0,
-    "sites": 30
+    "sites": 31,
+    "sites_attributed": 27
   },
   "django-helpdesk": {
     "model_parse_errors": 0,
     "models": 45,
     "parse_errors": 0,
-    "sites": 64
+    "sites": 64,
+    "sites_attributed": 64
   },
   "django-machina": {
     "model_parse_errors": 0,
     "models": 42,
     "parse_errors": 0,
-    "sites": 3
+    "sites": 3,
+    "sites_attributed": 3
   },
   "django-oscar": {
     "model_parse_errors": 0,
     "models": 244,
     "parse_errors": 0,
-    "sites": 36
+    "sites": 35,
+    "sites_attributed": 32
   },
   "misago": {
     "model_parse_errors": 0,
     "models": 100,
     "parse_errors": 0,
-    "sites": 142
+    "sites": 140,
+    "sites_attributed": 140
   },
   "readthedocs": {
     "model_parse_errors": 0,
     "models": 167,
     "parse_errors": 0,
-    "sites": 115
+    "sites": 116,
+    "sites_attributed": 114
   },
   "wagtail": {
     "model_parse_errors": 0,
     "models": 390,
     "parse_errors": 0,
-    "sites": 368
+    "sites": 369,
+    "sites_attributed": 352
   }
 }
