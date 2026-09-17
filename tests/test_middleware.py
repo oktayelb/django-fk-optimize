@@ -48,6 +48,35 @@ def test_a_request_is_recorded(db, tmp_path, request_):
     assert records[0].function == "get_response"
 
 
+def test_each_request_is_one_invocation(db, tmp_path, request_):
+    """Three hits on a page that issues two lookups is an N of two, not six.
+
+    The middleware builds a recorder per request, so the boundary was always
+    there; until the recorder stamped a run onto its records, nothing on disk
+    could see it and the N grew with the traffic.
+    """
+    from tests.testapp.models import Publisher
+
+    def get_response(request):
+        for _ in range(2):
+            list(Publisher.objects.all())
+        return "response"
+
+    path = tmp_path / "recording.jsonl"
+    with settings_for(path):
+        middleware = FkOptimizeMiddleware(get_response)
+        for _ in range(3):
+            middleware(request_)
+
+    loaded = store.load(path)
+    (found,) = loaded.groups()
+
+    assert len({record.run for record in loaded.records}) == 3
+    assert found.count == 2
+    assert found.total == 6
+    assert found.invocations == 3
+
+
 def test_queries_outside_the_request_are_not_recorded(db, tmp_path, request_):
     from tests.testapp.models import Publisher
 

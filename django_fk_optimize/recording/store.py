@@ -25,6 +25,7 @@ import time
 from dataclasses import asdict, dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path
+from statistics import median
 
 # What a query does to the database, as far as the N+1 hunt cares.
 SINGLE_ROW = "single"  # one row, looked up by one value -- the N+1 signature
@@ -70,6 +71,12 @@ class Record:
     source: str = "python"
     context: tuple[tuple[str, int, str], ...] = ()
     db: str = "default"
+    # Which invocation issued this query: one recorder's id.  Without it a
+    # recording is a heap -- the same lookup from the same line reads the same
+    # whether it ran twenty times on one page load or once on twenty of them,
+    # and those are a bug and a non-bug.  Empty means a file written before
+    # runs were recorded.
+    run: str = ""
 
     @property
     def attribution(self) -> Attribution:
@@ -97,6 +104,10 @@ class Record:
                 if len(frame) >= 3
             ),
             db=str(data.get("db") or "default"),
+            # Absent in any file written before runs existed, and absent for
+            # good: those records are read as one anonymous invocation rather
+            # than rejected.
+            run=str(data.get("run") or ""),
         )
 
 
@@ -104,27 +115,80 @@ class Record:
 class QueryGroup:
     """Every occurrence of one query shape at one call site.
 
-    `count` is the N in "N+1".  It is the repeat count, not a row count from
-    the cursor: `cursor.rowcount` is -1 for a SELECT on most backends, and the
-    number that matters is how many times the query ran anyway.
+    Two counts live here, and confusing them is the difference between a
+    finding and a fiction.  `count` is the N in "N+1": how many times this
+    query ran in *one* invocation of the code that issues it.  `total` is how
+    many times it ran in the whole recording, which is `count` again for every
+    invocation that went through the same line.  A recording made the way the
+    README asks for one -- click through the pages, run the suite, leave it on
+    in staging -- holds many invocations, so `total` is a measure of traffic
+    and only `count` describes the loop anybody can go and fix.
+
+    Neither is a row count from the cursor: `cursor.rowcount` is -1 for a
+    SELECT on most backends, and the number that matters is how many times the
+    query ran anyway.
+
+    `seconds` and `total_seconds` divide the same way -- time in one
+    invocation, time across the recording -- and pair with the count of the
+    same reach.  A per-call N printed beside a whole-recording duration is the
+    same category error in two columns.
+
+    Records from different invocations that share a shape and a call site stay
+    in one group.  They are one finding seen several times, and the several
+    times are what make `count` more than one unlucky request.
     """
 
     shape_hash: str
     table: str | None
     attribution: Attribution
     source: str
+    # Per invocation: the N, and the time this query cost one call.
     count: int
     total_seconds: float
     kind: str
     shape: str = ""
+    # Across the recording.  Stated together or not at all, so that a group
+    # assembled by hand can give the per-call numbers only; see __post_init__.
+    total: int = 0
+    invocations: int = 1
+    seconds: float = 0.0
+
+    def __post_init__(self):
+        """Read a group that states no totals as a single invocation.
+
+        `group()` states every field.  Anything else building a QueryGroup --
+        a test fixture, a caller folding records from somewhere that is not a
+        recording file -- knows one call's worth of numbers and means exactly
+        one call of them.  That is the same reading a recording written before
+        runs existed gets, so the two arrive at one answer instead of at two
+        defensible ones.
+
+        `total` is the flag for both, because zero is unambiguous there: a
+        group exists because at least one record made it, so no real group
+        carries a total of zero, while a group whose queries were all too
+        quick to time carries a perfectly real zero duration.
+        """
+        if not self.total:
+            object.__setattr__(self, "total", self.count)
+            object.__setattr__(self, "seconds", self.total_seconds)
 
     @property
     def average_seconds(self) -> float:
-        return self.total_seconds / self.count if self.count else 0.0
+        """What one execution of this query cost.
+
+        Over `total`, not `count`: every execution in the file is a sample of
+        how long this query takes, and there is no reason to average over the
+        subset that one invocation happened to contain.
+        """
+        return self.total_seconds / self.total if self.total else 0.0
 
     @property
     def is_n_plus_one(self) -> bool:
-        """Repeated single-row lookups from one place: the signature."""
+        """Repeated single-row lookups from one place: the signature.
+
+        More than one *per call*.  The same query on each of fifty page loads
+        is fifty rows fetched one at a time and nothing at all to fix.
+        """
         return self.kind == SINGLE_ROW and self.count > 1
 
 
@@ -166,6 +230,23 @@ class Recording:
         """
         newest = self.newest
         return None if newest is None else max(time.time() - newest, 0.0)
+
+    @property
+    def invocations(self) -> int:
+        """How many separate calls this recording covers.
+
+        Counted here rather than folded out of the groups, because a group
+        remembers how many invocations it was folded from but not which ones.
+        Two pages hit three and five times give groups saying 3 and 5, and
+        neither the larger nor the sum is the answer -- the first understates
+        and the second counts one page load once per query shape it issued.
+        The records still carry their run ids, so the union is exact and there
+        is no reason to estimate it.
+
+        A recording written before runs were recorded has one anonymous run and
+        counts as the single invocation it is read as everywhere else.
+        """
+        return len({record.run for record in self.records})
 
     def groups(self) -> list[QueryGroup]:
         return group(self.records)
@@ -296,32 +377,69 @@ def group(records) -> list[QueryGroup]:
     Grouped by shape *and* call site: the same lookup issued from two views is
     two findings with two fixes, and merging them would report an N that no
     single place ever produced.
+
+    Not grouped by run.  Two hits on the same page are one finding, and
+    splitting them would turn a loop seen fifty times into fifty loops.  The
+    run is used inside each group instead, to divide what the file holds by
+    how many invocations put it there -- which is the only reason this tool
+    knows an N a static linter cannot work out, and the only reason that N is
+    an answer about one page load rather than about an afternoon of traffic.
+
+    A record with no run belongs to a file written before runs were recorded.
+    Every one of them falls in the same empty-string bucket, so such a file
+    reads as a single invocation and reports exactly what it always did.
     """
     buckets: dict[tuple, dict] = {}
     for record in records:
         key = (record.shape_hash, record.file, record.line, record.source)
         bucket = buckets.get(key)
         if bucket is None:
-            buckets[key] = {
+            bucket = buckets[key] = {
                 "shape_hash": record.shape_hash,
                 "table": table_of(record.shape),
                 "attribution": record.attribution,
                 "source": record.source,
-                "count": 1,
-                "total_seconds": record.duration,
                 "kind": kind_of(record.shape),
                 "shape": record.shape,
+                "runs": {},
             }
-        else:
-            bucket["count"] += 1
-            bucket["total_seconds"] += record.duration
-    groups = [QueryGroup(**bucket) for bucket in buckets.values()]
+        tally = bucket["runs"].setdefault(record.run, [0, 0.0])
+        tally[0] += 1
+        tally[1] += record.duration
+    groups = [_fold(bucket) for bucket in buckets.values()]
     groups.sort(
         key=lambda item: (
             -item.count,
+            -item.total,
             -item.total_seconds,
             item.attribution.file,
             item.attribution.line,
         )
     )
     return groups
+
+
+def _fold(bucket: dict) -> QueryGroup:
+    """One bucket's per-run tallies, as the per-call and whole-file figures.
+
+    The median, not the mean: a recording picks up whatever the application
+    was doing, and one request that hit an empty page, or one that hit a
+    paginated view on its last page, must not be allowed to decide what the
+    loop does.  It is the same choice the benchmark makes across its repeats,
+    for the same reason.
+
+    An even number of invocations can put the median between two of them, so
+    it is rounded -- N is a count of queries and there is no such thing as
+    half a query.
+    """
+    runs = bucket.pop("runs")
+    counts = [count for count, _ in runs.values()]
+    seconds = [total for _, total in runs.values()]
+    return QueryGroup(
+        count=round(median(counts)),
+        total_seconds=sum(seconds),
+        total=sum(counts),
+        invocations=len(runs),
+        seconds=median(seconds),
+        **bucket,
+    )

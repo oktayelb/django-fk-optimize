@@ -393,3 +393,82 @@ def test_a_foreign_wrapper_is_left_alone(db, path):
         with recording.record(path):
             pass
         assert connection.execute_wrappers == [other]
+
+
+# -- invocations -------------------------------------------------------
+
+
+def one_page_of_books():
+    """The N+1 the whole tool is about: one lookup per row, from one line."""
+    from tests.testapp.models import Book
+
+    return [book.publisher.name for book in Book.objects.all()]
+
+
+def test_every_record_in_a_block_carries_that_blocks_run(db, path):
+    from tests.testapp.models import Publisher
+
+    with recording.record(path) as recorder:
+        for _ in range(3):
+            list(Publisher.objects.all())
+
+    assert len(recorder.run) == 16
+    assert {record.run for record in recorded(path)} == {recorder.run}
+
+
+def test_two_blocks_are_two_invocations(db, path):
+    from tests.testapp.models import Publisher
+
+    with recording.record(path) as first:
+        list(Publisher.objects.all())
+    with recording.record(path) as second:
+        list(Publisher.objects.all())
+
+    assert first.run != second.run
+    assert {record.run for record in recorded(path)} == {first.run, second.run}
+
+
+def test_the_n_is_per_call_when_the_page_was_hit_more_than_once(library, path):
+    """A recording of three page loads describes one of them.
+
+    The README asks for a recording made by clicking through the site, running
+    the suite, or leaving this on in staging, so this is the ordinary case and
+    not the exotic one.
+    """
+    for _ in range(3):
+        with recording.record(path):
+            one_page_of_books()
+
+    (found,) = [
+        group
+        for group in store.load(path).groups()
+        if group.table == "testapp_publisher"
+    ]
+
+    assert found.count == len(library["books"])  # the loop, once
+    assert found.total == len(library["books"]) * 3  # the file
+    assert found.invocations == 3
+    assert found.is_n_plus_one is True
+
+
+def test_several_calls_inside_one_block_are_still_one_invocation(library, path):
+    """The known limit of the boundary, asserted so it is not a surprise.
+
+    A recorder is an invocation, and a `record()` block is one recorder.  Three
+    passes over the books inside a single block leave three passes' worth of
+    lookups with one run on them, and `count` says so.  A request is a block,
+    so the middleware never has this; a script that loops does, and the block
+    belongs inside the loop.
+    """
+    with recording.record(path):
+        for _ in range(3):
+            one_page_of_books()
+
+    (found,) = [
+        group
+        for group in store.load(path).groups()
+        if group.table == "testapp_publisher"
+    ]
+
+    assert found.invocations == 1
+    assert found.count == len(library["books"]) * 3

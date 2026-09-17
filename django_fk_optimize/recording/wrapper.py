@@ -41,6 +41,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import lru_cache
 from pathlib import Path
+from uuid import uuid4
 
 from . import store
 from .store import Record
@@ -254,6 +255,20 @@ class Recorder:
     One write per request, not one per query: a recorder that opens a file
     inside the query path has turned a read-heavy page into a write-heavy one
     and is now measuring itself.
+
+    **One recorder is one invocation, and stamps every record with `run`.**
+    The boundary is not a new concept: the middleware builds a recorder per
+    request and `record()` builds one per block, so a recorder already is the
+    unit the N in "N+1" is counted per.  Until this was written down, a
+    recording of ten page loads reported ten pages' worth of lookups as the N
+    of one of them, and the README asks for exactly such a recording -- click
+    through the site, run the suite, leave it on in staging.
+
+    It also makes SAMPLE_RATE correct rather than merely cheap.  Sampling drops
+    whole invocations, so a sampled recording holds fewer of them and says so;
+    the N per invocation is the N of the ones that were kept.  Divided by
+    nothing, sampling used to deflate the headline figure silently -- record a
+    tenth of the traffic and the N+1 looked a tenth as bad.
     """
 
     def __init__(
@@ -265,6 +280,13 @@ class Recorder:
         enabled: bool | None = None,
     ):
         self.path = Path(path) if path else None
+        # Random, not a pid or a counter: worker processes append to one file
+        # with no coordination, they restart, and the operating system hands
+        # their pids out again.  Two invocations that claimed the same id would
+        # be folded into one and halve the N, which is the failure this exists
+        # to stop.  Sixteen hex digits is 64 bits, and a recording is bounded
+        # by MAX_RECORDS lines.
+        self.run = uuid4().hex[:16]
         self.max_records = max_records
         self.sample_rate = sample_rate
         self.enabled = enabled
@@ -413,6 +435,7 @@ class Recorder:
                 source=source,
                 context=frames,
                 db=_alias_of(context) if context is not None else "default",
+                run=self.run,
             )
         )
 
