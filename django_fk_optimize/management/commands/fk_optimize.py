@@ -48,7 +48,14 @@ from ...analysis.benchmark import (
 )
 from ...analysis.cardinality import Cardinalities
 from ...analysis.report import Coverage, render_text
-from ...analysis.verdicts import Costed, Tables, build, cost, reconcile
+from ...analysis.verdicts import (
+    EVIDENCE_NONE,
+    Costed,
+    Tables,
+    build,
+    cost,
+    reconcile,
+)
 from ...recording import store
 from ...utils.callsites import PROBABLE, RESOLVED, scan_files
 from ...utils.sources import app_in_scope, discover, is_third_party
@@ -450,10 +457,40 @@ class Command(BaseCommand):
         if options["clear_recording"] and recording.exists:
             store.clear(path)
 
-        findings = [verdict for verdict in verdicts if verdict.actionable]
-        if options["fail_on_findings"] and findings:
+        if options["fail_on_findings"]:
+            self._gate([verdict for verdict in verdicts if verdict.actionable])
+
+    def _gate(self, findings) -> None:
+        """Fail the build on the findings there is evidence for, and only those.
+
+        A verdict whose evidence is `EVIDENCE_NONE` is a real call site over a
+        table with no rows behind it: the loop is there, and how much fixing
+        it would save is a question nothing in this run could answer.  Failing
+        a build on it asks somebody to rewrite a queryset on the strength of
+        an empty table, and the first time that happens the gate comes back
+        out of the pipeline for good.
+
+        They stay in the report, because a call site nobody has exercised yet
+        is worth reading about.  The count of them is printed here rather than
+        dropped silently, since a gate that quietly ignores a category of
+        finding is indistinguishable from a gate that has stopped working.
+        """
+        counted = [verdict for verdict in findings if verdict.evidence != EVIDENCE_NONE]
+        ignored = len(findings) - len(counted)
+        if ignored:
+            # stderr, not stdout: --json with no path hands stdout to the
+            # payload, and a note about the gate is not part of the report.
+            self.stderr.write(
+                self.style.NOTICE(
+                    f"{report_module.plural(ignored, 'actionable finding')} "
+                    "not counted by --fail-on-findings: no rows in the "
+                    "table means no evidence for what a fix would save. "
+                    "Every one is still in the report above."
+                )
+            )
+        if counted:
             raise CommandError(
-                f"{report_module.plural(len(findings), 'actionable finding')} "
+                f"{report_module.plural(len(counted), 'actionable finding')} "
                 "(--fail-on-findings)"
             )
 

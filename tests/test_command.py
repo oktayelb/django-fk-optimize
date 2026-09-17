@@ -9,12 +9,14 @@ import io
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from django.core.management import call_command
 from django.core.management.base import CommandError
 
 from django_fk_optimize.management.commands.fk_optimize import (
+    EVIDENCE_NONE,
     FORWARD,
     MANY_TO_MANY,
     REVERSE,
@@ -686,3 +688,59 @@ def test_naming_an_installed_app_scans_it(installed_testapp, library):
     )
 
     assert "testapp.Book.publisher" in output
+
+
+# -- what the gate counts ----------------------------------------------
+
+
+def test_the_gate_does_not_count_a_finding_with_no_rows_behind_it(db, tmp_path):
+    """An empty table is a call site with nothing behind it.
+
+    The loop is really there, so the report keeps it; what fixing it would
+    save is a question this run could not answer, so the build does not fail
+    on it.  Asserted as a relationship between the two numbers rather than as
+    a literal count, because what the test app contains is not the point.
+    """
+    out, err = io.StringIO(), io.StringIO()
+    with pytest.raises(CommandError) as raised:
+        call_command(
+            "fk_optimize",
+            "testapp",
+            "--repeat",
+            "1",
+            "--sample-size",
+            "12",
+            "--recording",
+            str(tmp_path / "absent.jsonl"),
+            "--fail-on-findings",
+            stdout=out,
+            stderr=err,
+        )
+
+    output = out.getvalue()
+    printed = int(re.search(r"(\d+) changes? worth making", output).group(1))
+    unevidenced = output.count("evidence: none")
+    counted = int(re.match(r"(\d+) actionable", str(raised.value)).group(1))
+
+    assert unevidenced, "the empty database is the whole point of this case"
+    assert counted == printed - unevidenced
+    # And the difference is stated, not left for somebody to work out from
+    # two numbers that no longer agree.
+    assert "not counted by --fail-on-findings" in err.getvalue()
+    assert "no rows in the table" in err.getvalue()
+
+
+def test_the_gate_opens_when_nothing_has_evidence_behind_it(capsys):
+    """Duck-typed on purpose: the gate reads one attribute off a verdict.
+
+    Building the real ones would need a database, a scan and a benchmark to
+    assert on a rule that is two lines long.
+    """
+    Command()._gate(
+        [
+            SimpleNamespace(evidence=EVIDENCE_NONE),
+            SimpleNamespace(evidence=EVIDENCE_NONE),
+        ]
+    )
+
+    assert "2 actionable findings not counted" in capsys.readouterr().err
