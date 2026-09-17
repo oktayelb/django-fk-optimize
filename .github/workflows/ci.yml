@@ -206,9 +206,13 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  # The one that asserts the product rather than its parts: a real project with
-  # a real N+1, the command run as a gate, exit 1 with the relation named, then
-  # exit 0 once the printed fix is applied.
+  # The one that asserts the product rather than its parts: throwaway projects
+  # with real N+1s, the command run as a gate, exit 1 with the relation named,
+  # then exit 0 once the printed fix is applied. Five shapes, each guarding a
+  # bug that shipped: N counted per call rather than per recording, a two-hop
+  # chain hinted in full rather than halfway, a queryset reached through
+  # self.get_queryset(), and an app out of site-packages that is neither
+  # reported nor allowed to trip the gate.
   smoke:
     name: smoke
     runs-on: ubuntu-latest
@@ -229,7 +233,9 @@ jobs:
           "$RUNNER_TEMP/smokeenv/bin/pip" install --upgrade pip
           "$RUNNER_TEMP/smokeenv/bin/pip" install dist/*.whl
 
-      # `python scripts/smoke.py` puts scripts/ on sys.path, not the repo root,
-      # so the wheel is what the throwaway project imports.
-      - name: Find the N+1, then stop finding it
+      # Run by the virtualenv's interpreter, so the wheel is what the throwaway
+      # projects import. The script only falls back to putting the repository
+      # root on PYTHONPATH when that interpreter cannot import the package at
+      # all, which is the source-tree case and not this one.
+      - name: Find the N+1s, then stop finding them
         run: "$RUNNER_TEMP/smokeenv/bin/python scripts/smoke.py"
