@@ -82,13 +82,22 @@ MANY_TO_MANY = "m2m"
 
 @dataclass(frozen=True)
 class RelationPlan:
-    """How one relation has to be timed.
+    """How one relation -- or one `__` path of them -- has to be timed.
 
     The two names differ and conflating them is the bug this exists to stop.
     A reverse relation's `name` is the related_query_name ("book"), which is
     what a filter takes; its accessor is "book_set", which is what an instance
     answers to.  Passing one where the other belongs raises FieldError or
     AttributeError, which is most of what made the old command crash.
+
+    A path keeps both meanings and widens neither: `name` is still what the
+    hint takes, which for `publisher__country` is the whole path, and
+    `accessor` is still what `getattr()` on a row of the *starting* model has
+    to ask for, which is the first hop.  What the path adds is `hops`, because
+    the timing has to walk every one of them.  Reading only `publisher` would
+    provoke one query per row and then report that number for a loop that
+    really costs two, and reading only `country` cannot be done at all --
+    there is no such attribute on a Book.
     """
 
     name: str  # what select_related()/prefetch_related() take
@@ -96,6 +105,14 @@ class RelationPlan:
     kind: str
     many: bool  # the accessor hands back a manager, not an instance
     strategies: tuple[FieldOperation, ...]
+    # Every hop, in order, for a path.  Empty for a single relation, which is
+    # its own only hop; `chain` is what callers walk, so the two read alike.
+    hops: tuple[RelationPlan, ...] = ()
+
+    @property
+    def chain(self) -> tuple[RelationPlan, ...]:
+        """The hops to walk, shortest useful spelling for a single relation."""
+        return self.hops or (self,)
 
     @property
     def can_select_related(self) -> bool:
@@ -167,12 +184,67 @@ def plans_for(model: type[Model]) -> list[RelationPlan]:
     return plans
 
 
-def plan_named(model: type[Model], name: str) -> RelationPlan | None:
-    """The plan for one relation, by the name select_related() would take."""
-    for plan in plans_for(model):
-        if plan.name == name or plan.accessor == name:
-            return plan
+def _hop(model: type[Model], segment: str):
+    """One step of a path: its plan, and the model the step arrives at.
+
+    Matched against `plans_for()` rather than `_meta.get_field()` because a
+    reverse relation answers to two names and only one of them is a field: the
+    accessor a call site writes ("book_set") is not the related_query_name
+    get_field() takes ("book").  Going through the plans keeps the one place
+    that knows the difference in charge of it.
+    """
+    for field in model._meta.get_fields():
+        plan = plan_for(field)
+        if plan is not None and segment in (plan.name, plan.accessor):
+            return plan, field.related_model
     return None
+
+
+def plan_named(model: type[Model], name: str) -> RelationPlan | None:
+    """The plan for one relation or one `__` path, as the hint would spell it.
+
+    A path is timed as a whole because that is what the code does: a loop that
+    reads `book.publisher.country.name` pays for two lazy loads per row, and
+    select_related("publisher__country") removes both.  Timing only the last
+    hop would measure a query the loop never issues on its own, and timing
+    only the first would under-report the cost by half.
+
+    select_related() is offered only when *every* hop is joinable.  One
+    many-to-many anywhere along the path makes the join illegal -- Django
+    raises FieldError -- so the whole path falls back to prefetch_related(),
+    which accepts `__` paths too.
+    """
+    hops: list[RelationPlan] = []
+    current: type[Model] | None = model
+    for segment in name.split("__"):
+        if current is None:
+            return None
+        found = _hop(current, segment)
+        if found is None:
+            return None
+        plan, current = found
+        hops.append(plan)
+
+    if not hops:
+        return None
+    if len(hops) == 1:
+        return hops[0]
+
+    strategies = (
+        ALL_STRATEGIES
+        if all(hop.can_select_related for hop in hops)
+        else NO_JOIN_STRATEGIES
+    )
+    return RelationPlan(
+        name=name,
+        accessor=hops[0].accessor,
+        kind=hops[-1].kind,
+        # A manager anywhere along the path means walking it hands back a set
+        # rather than a row, whatever the last hop is on its own.
+        many=any(hop.many for hop in hops),
+        strategies=strategies,
+        hops=tuple(hops),
+    )
 
 
 @dataclass(frozen=True)
@@ -324,20 +396,32 @@ class Benchmark:
         return qs[: self.sample_size]
 
     def touch(self, row: Model, plan: RelationPlan) -> None:
-        """Provoke the query a relation costs when it is not hinted.
+        """Provoke the queries a relation costs when it is not hinted.
 
         A reverse or m2m accessor returns a related manager, and a manager
         issues no query until something consumes it -- so merely reading the
         attribute measures nothing at all.
+
+        Every hop of a path is walked, because every hop is a query per row of
+        the hop before it.  Stopping at the first one would time a cheaper loop
+        than the one being reported on, and the number would be quoted as if it
+        were the real one.
         """
-        try:
-            value = getattr(row, plan.accessor)
-        except ObjectDoesNotExist:
-            # A reverse one-to-one with no row on the other side.
-            return
-        if plan.many and value is not None:
-            for _related in value.all():
-                pass
+        reached: list[object] = [row]
+        for hop in plan.chain:
+            following: list[object] = []
+            for instance in reached:
+                try:
+                    value = getattr(instance, hop.accessor)
+                except ObjectDoesNotExist:
+                    # A reverse one-to-one with no row on the other side.
+                    continue
+                if value is None:  # a nullable FK, and nothing to follow
+                    continue
+                following.extend(value.all() if hop.many else [value])
+            if not following:
+                return
+            reached = following
 
     def run_once(
         self,

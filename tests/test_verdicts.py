@@ -889,3 +889,253 @@ def test_a_line_with_one_change_is_left_exactly_as_it_was(vocabulary, tables):
     assert V.reconcile(verdicts) == 0
     assert finding.fix == before
     assert not any("changes on this line" in note for note in finding.notes)
+
+
+# ----------------------------------------------------------------------
+# relations that are paths
+# ----------------------------------------------------------------------
+
+TWO_HOP = """
+from tests.testapp.models import Book
+
+
+def chain():
+    for book in Book.objects.all():
+        send(book.author.favourite_publisher.name)
+"""
+
+
+def test_a_two_hop_chain_is_one_finding_at_the_deeper_path(vocabulary, tables):
+    """The bug this section exists for: the second hop used to vanish.
+
+    `touched` carries both prefixes, `missing` collapses to the deepest, and a
+    loop over `touched` that looked each entry up as a relation of Book found
+    `author`, missed `author__favourite_publisher`, and -- because the prefix
+    is not in `missing` -- reported the one relation it did find as already
+    hinted. Two hops became one reassurance and no finding at all.
+    """
+    sites = sites_for(TWO_HOP, vocabulary)
+    site = site_at(sites, "chain")
+    assert site.touched == ("author", "author__favourite_publisher")
+    assert site.missing == ("author__favourite_publisher",)
+
+    verdicts, _ = V.build(sites, [], vocabulary, tables)
+
+    assert [verdict.kind for verdict in verdicts] == [V.EXTRA_QUERY]
+    assert verdicts[0].relation == "author__favourite_publisher"
+    assert verdicts[0].actionable is True
+    assert V.ALREADY_HINTED not in [verdict.kind for verdict in verdicts], (
+        "nobody hinted anything here"
+    )
+
+
+def test_the_fix_for_a_two_hop_chain_is_one_hint_over_both(vocabulary, tables):
+    touch = line_of(TWO_HOP, "favourite_publisher.name")
+    sites = sites_for(TWO_HOP, vocabulary)
+
+    verdicts, _ = V.build(
+        sites, [lookup(PUBLISHERS, line=touch, count=120)], vocabulary, tables
+    )
+    finding = only(verdicts, V.N_PLUS_ONE)
+
+    assert (
+        finding.fix
+        == 'Book.objects.all().select_related("author__favourite_publisher")'
+    )
+    assert finding.rows == V.Rows(120, V.OBSERVED)
+
+
+def test_a_query_on_the_last_hop_confirms_the_whole_path(vocabulary, tables):
+    """The recorded table is Publisher's; the path that ends there is the deep one."""
+    touch = line_of(TWO_HOP, "favourite_publisher.name")
+    sites = sites_for(TWO_HOP, vocabulary)
+
+    result = V.join([lookup(PUBLISHERS, line=touch)], sites, vocabulary, tables)
+
+    assert result.matched[0].relation == "author__favourite_publisher"
+    assert result.matched[0].by_table is True
+    assert result.matched[0].confidence == RESOLVED
+
+
+def test_a_query_on_an_intermediate_hop_joins_the_finding_that_covers_it(
+    vocabulary, tables
+):
+    """Both hops are real N+1s and one hint settles both, so they are one finding.
+
+    The author lookup is as real as the publisher lookup -- the loop issues
+    both, once per row. Attributing it to the bare `author` prefix would file
+    it against a verdict nobody emits, and the observed numbers would be lost
+    along with it.
+    """
+    touch = line_of(TWO_HOP, "favourite_publisher.name")
+    sites = sites_for(TWO_HOP, vocabulary)
+
+    result = V.join([lookup(AUTHORS, line=touch, count=77)], sites, vocabulary, tables)
+    assert result.matched[0].relation == "author__favourite_publisher"
+
+    verdicts, _ = V.build(
+        sites, [lookup(AUTHORS, line=touch, count=77)], vocabulary, tables
+    )
+    finding = only(verdicts, V.N_PLUS_ONE)
+    assert finding.observed_queries == 77
+
+
+HINTED_TWO_HOP = """
+from tests.testapp.models import Book
+
+
+def chain():
+    for book in Book.objects.select_related("author__favourite_publisher"):
+        send(book.author.favourite_publisher.name)
+"""
+
+
+def test_a_deep_hint_covers_the_prefix_and_says_which_hint_did_it(vocabulary, tables):
+    sites = sites_for(HINTED_TWO_HOP, vocabulary)
+
+    verdicts, _ = V.build(sites, [], vocabulary, tables)
+
+    assert all(verdict.kind == V.ALREADY_HINTED for verdict in verdicts)
+    assert not any(verdict.actionable for verdict in verdicts)
+    # Both hops are accounted for, and each one names the hint really written
+    # on the line rather than the path it was asked about.
+    assert {verdict.relation for verdict in verdicts} == {
+        "author",
+        "author__favourite_publisher",
+    }
+    for verdict in verdicts:
+        assert 'select_related("author__favourite_publisher")' in verdict.headline
+
+
+UNUSED_DEEP = """
+from tests.testapp.models import Book
+
+
+def titles():
+    for book in Book.objects.select_related("author__mentor"):
+        send(book.title)
+"""
+
+
+def test_an_unused_deep_hint_is_still_reported(vocabulary, tables):
+    """It used to be dropped: `author__mentor` is not a relation of Book."""
+    sites = sites_for(UNUSED_DEEP, vocabulary)
+
+    verdicts, _ = V.build(sites, [], vocabulary, tables)
+    verdict = only(verdicts, V.REMOVE_HINT)
+
+    assert verdict.relation == "author__mentor"
+    assert verdict.fix == "Book.objects"
+
+
+PREFETCHED_DEEP = """
+from tests.testapp.models import Club
+
+
+def clubs():
+    for club in Club.objects.prefetch_related("books__publisher"):
+        for book in club.books.all():
+            send(book.publisher.name)
+"""
+
+
+def test_a_deep_prefetch_is_never_reported_as_a_join(vocabulary, tables):
+    """`books` is a many-to-many; select_related() on it raises FieldError.
+
+    The old code asked whether the touched name was in `hints.prefetch`,
+    found `books` was not (`books__publisher` is), and fell through to the
+    branch that prints "already covered by select_related(...)" -- advice
+    Django refuses to take.
+    """
+    sites = sites_for(PREFETCHED_DEEP, vocabulary)
+
+    verdicts, _ = V.build(sites, [], vocabulary, tables)
+    verdict = only(verdicts, V.KEEP_PREFETCH)
+
+    assert 'prefetch_related("books__publisher")' in verdict.headline
+    assert "select_related" not in verdict.headline
+
+
+def test_a_hint_needs_every_hop_to_be_joinable(vocabulary, tables):
+    """One manager hop anywhere makes the whole path a prefetch."""
+    assert V._prefetch_only(vocabulary, "testapp.Club", "books__publisher") is True
+    assert V._prefetch_only(vocabulary, "testapp.Book", "author__mentor") is False
+    assert V._prefetch_only(vocabulary, "testapp.Author", "profile") is False, (
+        "the reverse side of a one-to-one is the one reverse relation Django joins"
+    )
+
+
+DEEP_ID_ONLY = """
+from tests.testapp.models import Book
+
+
+def ids():
+    for book in Book.objects.all():
+        send(book.author.mentor_id)
+"""
+
+
+def test_a_column_attribute_at_the_end_of_a_path_is_recognised(vocabulary, tables):
+    """`mentor_id` is a column of Author, not of Book.
+
+    Checked against Book's columns it matched nothing and produced no verdict
+    at all -- no crash, just silence about a touch the scanner had understood
+    perfectly.
+    """
+    sites = sites_for(DEEP_ID_ONLY, vocabulary)
+    assert site_at(sites, "ids").id_only == ("author__mentor_id",)
+
+    verdicts, _ = V.build(sites, [], vocabulary, tables)
+    verdict = only(verdicts, V.ID_ONLY)
+
+    assert verdict.relation == "author__mentor"
+    assert "mentor_id is already on the row" in verdict.headline
+    # The author itself still has to be loaded to read a column off it.
+    assert only(verdicts, V.EXTRA_QUERY).relation == "author"
+
+
+CHAIN = """
+from testapp.models import Book
+
+
+def catalogue():
+    for book in Book.objects.all():
+        print(book.author.favourite_publisher.name)
+"""
+
+
+def test_a_chain_reports_the_rows_it_looped_over_and_the_queries_it_cost(
+    vocabulary, tables
+):
+    """Two hops are two recorded groups, one finding, and two different numbers.
+
+    `book.author.favourite_publisher` goes back to the database twice for
+    every row, so the loop is twelve rows long and cost twenty-four queries.
+    Reporting the sum as the row count would claim a loop nobody wrote;
+    reporting one group's count as the cost prints "1 + 12 queries" beside
+    "24 fewer queries" and contradicts itself inside one block.
+    """
+    sites = sites_for(CHAIN, vocabulary)
+    site = site_at(sites, "catalogue")
+    touch = line_of(CHAIN, "favourite_publisher.name")
+    groups = [
+        bulk(BOOKS, line=line_of(CHAIN, "Book.objects.all()"), function="catalogue"),
+        lookup(AUTHORS, line=touch, count=12, function="catalogue"),
+        lookup(PUBLISHERS, line=touch, count=12, function="catalogue"),
+    ]
+
+    verdicts, result = V.build([site], groups, vocabulary, tables)
+
+    (finding,) = [v for v in verdicts if v.actionable]
+    assert finding.relation == "author__favourite_publisher"
+    assert finding.rows.n == 12  # the loop, not the traffic
+    assert finding.rows.provenance == V.OBSERVED
+    assert finding.observed_queries == 24  # the traffic, not the loop
+    assert "24 extra queries" in finding.headline
+    assert "2 per row" in finding.headline
+    assert 'select_related("author__favourite_publisher")' in finding.fix
+
+    # Neither hop is dropped: both groups matched, and both are spoken for by
+    # the one finding whose single hint removes them.
+    assert len(result.matched) == 2
+    assert not result.unattributed

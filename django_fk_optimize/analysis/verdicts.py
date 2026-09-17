@@ -26,6 +26,15 @@ is what separates the match from the coincidence.  Scope and table both ->
 holds forward many-to-one relations, so `prefetch_related("tags")` looks unused
 to a scanner that cannot see an m2m touch.  Only a hint naming a forward
 relation of the model is ever reported as removable.
+
+**A relation is a path, not a name.**  `book.publisher.country` is
+`publisher__country`, two hops and two lazy loads per row, and one hint that
+carries both.  Everything here resolves through `Vocabulary.resolve_path()` and
+`resolve_hops()` rather than looking a name up on the starting model, because
+the second hop is not a relation of the model the loop iterates and a lookup
+that expects it to be silently drops the deeper half of every chain.  The hops
+matter on their own too: select_related() is legal only when every one of them
+is joinable.
 """
 
 from __future__ import annotations
@@ -41,7 +50,7 @@ from django.db import DatabaseError
 from ..recording.store import BULK, QueryGroup
 from ..recording.wrapper import PYTHON, SERIALIZER, TEMPLATE
 from ..utils.callsites import PROBABLE, RESOLVED, CallSite
-from ..utils.vocabulary import FORWARD, Vocabulary
+from ..utils.vocabulary import FORWARD, Relation, Vocabulary
 from .benchmark import (
     DEFAULT_SAMPLE_SIZE,
     MEASURED,
@@ -184,34 +193,72 @@ class JoinResult:
         return len(self.matched) + len(self.runtime_only)
 
 
-def _forward(site: CallSite, vocabulary: Vocabulary):
-    info = vocabulary.models.get(site.model)
-    if info is None:
-        return {}
+def _touched(site: CallSite, vocabulary: Vocabulary) -> dict[str, Relation]:
+    """Every path this site reaches through, and the relation it ends at.
+
+    Keyed by the whole path, valued by its *last* hop, because that is the hop
+    whose target table a recorded query can be matched against.  A path the
+    vocabulary cannot walk is dropped rather than half-walked: an intermediate
+    model from an app this run does not cover is a gap, and a guess about the
+    rest of the chain would be worse than the gap.
+    """
     return {
-        name: relation
-        for name in site.touched
-        if (relation := info.relation(name)) is not None
+        path: relation
+        for path in site.touched
+        if (relation := vocabulary.resolve_path(site.model, path)) is not None
     }
 
 
+def _reported_as(site: CallSite, path: str) -> str:
+    """The path the fix will name, for a path a table matched.
+
+    `touched` carries every prefix, and a site reading
+    `book.publisher.country.name` issues a lazy query on the publisher table
+    *and* on the country table.  It is reported once, at the deepest uncovered
+    path, because select_related("publisher__country") joins both -- so a
+    recorded N+1 on the publisher table belongs to the `publisher__country`
+    finding.  Returning the prefix instead would attach real observed numbers
+    to a verdict nobody emits, which is how a finding disappears.
+    """
+    if path in site.missing:
+        return path
+    deeper = [other for other in site.missing if other.startswith(path + "__")]
+    return deeper[0] if len(deeper) == 1 else path
+
+
 def _confirm(site, table, vocabulary, tables) -> str:
-    """The touched relation whose target table is `table`, or ""."""
-    for name, relation in _forward(site, vocabulary).items():
-        if table and tables.table(relation.target) == table:
-            return name
-    return ""
+    """The touched path whose final target table is `table`, or "".
+
+    Per hop, now that the prefixes are there: `author` confirms against the
+    author table and `author__mentor` against the mentor's.  An uncovered path
+    is preferred over a covered one, because a hinted relation issues no lazy
+    query at all -- which is what tells `author__mentor` apart from `author`
+    when both end at the same table, as a self-reference does.
+    """
+    if not table:
+        return ""
+    matched = [
+        path
+        for path, relation in _touched(site, vocabulary).items()
+        if tables.table(relation.target) == table
+    ]
+    for path in matched:
+        reported = _reported_as(site, path)
+        if reported in site.missing:
+            return reported
+    return matched[0] if matched else ""
 
 
 def _sole_missing(site, vocabulary) -> str:
-    """The one unhinted forward relation, when there is only one.
+    """The one uncovered path, when there is only one.
 
     A hinted relation issues no lazy query, so a recorded N+1 at this site can
     only have come from an unhinted one.  With exactly one of those, the name
     follows without a table to confirm it -- at `probable`, because "only one
     candidate" is a deduction and not an observation.
     """
-    missing = [name for name in site.missing if name in _forward(site, vocabulary)]
+    reachable = _touched(site, vocabulary)
+    missing = [path for path in site.missing if path in reachable]
     return missing[0] if len(missing) == 1 else ""
 
 
@@ -640,6 +687,96 @@ def fit(verdict: Verdict, *, prefetch: bool = False) -> None:
 CardinalityFor = Callable[[str, str], "Cardinality | None"]
 
 
+@dataclass(frozen=True)
+class Observation:
+    """Every recorded group that one finding speaks for.
+
+    A chain reported at a single path issues a lazy query on *every* hop along
+    it -- `book.publisher.country` costs two per row and is recorded as two
+    groups -- while the fix names one hint that removes both.  So the finding
+    carries two numbers that are emphatically not the same number:
+
+    * `rows` is how many rows the loop went round.  Every hop fires once per
+      row, so the largest group is the row count and adding the groups up
+      would multiply it by the length of the chain.
+    * `queries` is what those rows cost, which *is* the sum, because each hop
+      really did go back to the database.
+
+    Printing the first where the second belongs is what put `1 + 200 queries`
+    beside `400 fewer queries` in the same block -- the tool contradicting
+    itself four lines apart, which is the one thing a measurement tool cannot
+    do and stay believable.
+    """
+
+    matches: tuple[Match, ...]
+
+    @property
+    def primary(self) -> Match:
+        """The group the finding is described by: confidence, source, table.
+
+        The first, which is the deepest hop the join confirmed.  These are
+        facts about how the site was identified, and identification happened
+        once however many hops the chain has.
+        """
+        return self.matches[0]
+
+    @property
+    def rows(self) -> int:
+        return max(match.group.count for match in self.matches)
+
+    @property
+    def queries(self) -> int:
+        return sum(match.group.count for match in self.matches)
+
+    @property
+    def seconds(self) -> float:
+        return sum(match.group.seconds for match in self.matches)
+
+    @property
+    def invocations(self) -> int:
+        return max(match.group.invocations for match in self.matches)
+
+    @property
+    def hops(self) -> int:
+        """How many relations along the chain were separately recorded."""
+        return len(self.matches)
+
+
+class _Observed(dict):
+    """The matched groups, and which of them a verdict has spoken for.
+
+    A verdict speaks for a recorded group exactly when it reads that group's
+    numbers, so the read is the only place the fact is reliably known.
+    Recording it here keeps `build()`'s guarantee -- every matched group
+    produces a verdict -- one line away from the thing it guarantees, instead
+    of re-deriving it afterwards from the verdicts and getting it subtly wrong
+    for the one shape nobody thought of.
+
+    Values are `Observation`s rather than single matches, because several
+    recorded groups can belong to one finding; `add()` is what keeps them all
+    instead of letting the second hop overwrite the first.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.claimed: set[tuple[int, str]] = set()
+
+    def add(self, key, match: Match) -> None:
+        found = self.get_quietly(key)
+        matches = (found.matches if found is not None else ()) + (match,)
+        self[key] = Observation(matches)
+
+    def get_quietly(self, key) -> Observation | None:
+        """Read without claiming, for assembling rather than reporting."""
+        return dict.get(self, key)
+
+    def get(self, key, default=None):
+        if key in self:
+            self.claimed.add(key)
+            return self[key]
+        return default
+
+
 def build(
     sites: Iterable[CallSite],
     groups: Iterable[QueryGroup],
@@ -654,10 +791,10 @@ def build(
     sites = list(sites)
     result = join_result or join(groups, sites, vocabulary, tables)
 
-    observed: dict[tuple[int, str], Match] = {}
+    observed = _Observed()
     for match in result.matched:
         if match.relation:
-            observed.setdefault((id(match.site), match.relation), match)
+            observed.add((id(match.site), match.relation), match)
 
     verdicts: list[Verdict] = []
     for site in sites:
@@ -673,9 +810,11 @@ def build(
 
 def _rows(site, relation, observed, cardinality, sample_size) -> Rows:
     """N, in the order Trap D lays down: observed, then bound, then estimated."""
-    match = observed.get((id(site), relation))
-    if match is not None:
-        return Rows(match.group.count, OBSERVED)
+    found = observed.get((id(site), relation))
+    if found is not None:
+        # The largest group, not the sum: every hop of a chain fires once per
+        # row, so adding them up would report the loop as longer than it was.
+        return Rows(found.rows, OBSERVED)
     if site.bound is not None:
         return Rows(site.bound, STATIC_BOUND)
     stats = cardinality(site.model, relation) if cardinality else None
@@ -720,6 +859,22 @@ def _soften(verdict: Verdict, site: CallSite) -> None:
         )
 
 
+def _covering(hints: tuple[str, ...], path: str) -> str:
+    """The hint that already loads `path`, or "".
+
+    The same asymmetry `Hints.covers()` is built on, kept here so the verdict
+    can quote the hint that is really in the source rather than the path it
+    was asked about: a site that reads `book.publisher` under
+    select_related("publisher__country") is covered, and saying so in the
+    author's own words is the difference between a line they recognise and one
+    they go looking for.
+    """
+    for hint in hints:
+        if hint == path or hint.startswith(path + "__"):
+            return hint
+    return ""
+
+
 def _site_verdicts(site, observed, vocabulary, cardinality, sample_size):
     info = vocabulary.models.get(site.model)
     if info is None:
@@ -727,34 +882,45 @@ def _site_verdicts(site, observed, vocabulary, cardinality, sample_size):
     out: list[Verdict] = []
     missing = set(site.missing)
 
-    for relation in site.touched:
-        if info.relation(relation) is None:
+    for path in site.touched:
+        if vocabulary.resolve_path(site.model, path) is None:
             continue
-        if relation in missing:
+        prefetched = _covering(site.hints.prefetch, path)
+        selected = _covering(site.hints.select, path)
+        if path in missing:
             out.append(
-                _unhinted(site, relation, observed, cardinality, sample_size, info)
+                _unhinted(site, path, observed, cardinality, sample_size, vocabulary)
             )
-        elif relation in site.hints.prefetch:
-            out.append(_prefetched(site, relation, observed, cardinality, sample_size))
-        else:
+        elif prefetched:
+            out.append(
+                _prefetched(
+                    site, path, observed, cardinality, sample_size, hint=prefetched
+                )
+            )
+        elif selected:
             verdict = _base(
                 site,
                 ALREADY_HINTED,
-                relation,
-                _rows(site, relation, observed, cardinality, sample_size),
+                path,
+                _rows(site, path, observed, cardinality, sample_size),
             )
-            method = (
-                FieldOperation.PREFETCH_RELATED.value
-                if _prefetch_only(info, relation)
-                else FieldOperation.SELECT_RELATED.value
-            )
-            verdict.headline = f'already covered by {method}("{relation}")'
+            method = FieldOperation.SELECT_RELATED.value
+            verdict.headline = f'already covered by {method}("{selected}")'
             out.append(verdict)
+        # Otherwise this is a bare prefix of a deeper uncovered path -- the
+        # `publisher` of a site that reads `publisher.country.name`. It is not
+        # hinted and it is not the finding: one select_related("publisher__
+        # country") settles both hops, so the finding is filed against the
+        # deepest path and the prefix says nothing. Calling it `already_hinted`
+        # (which is what an `else` here did) told the reader a relation nobody
+        # had hinted was already taken care of.
 
     for relation in site.unused:
         # A hint the scanner cannot see a touch for is not an unused hint:
-        # `touched` only ever holds forward many-to-one relations.
-        if info.relation(relation) is None:
+        # `touched` only ever holds forward many-to-one relations.  Resolved as
+        # a path, so an unused select_related("publisher__country") is reported
+        # rather than dropped for not being a relation of Book.
+        if vocabulary.resolve_path(site.model, relation) is None:
             continue
         method = (
             FieldOperation.SELECT_RELATED.value
@@ -798,68 +964,112 @@ def _site_verdicts(site, observed, vocabulary, cardinality, sample_size):
         out.append(verdict)
 
     for attname in site.id_only:
+        # A column attribute is read off whatever model the path arrives at,
+        # not off the model the loop iterates: `book.author.mentor_id` is
+        # `mentor_id` on Author, and checking it against Book's columns finds
+        # nothing and says nothing.
+        prefix, _, column = attname.rpartition("__")
+        owner = info
+        if prefix:
+            arrival = vocabulary.resolve_path(site.model, prefix)
+            owner = vocabulary.models.get(arrival.target) if arrival else None
+        if owner is None:
+            continue
         relation = next(
-            (rel.name for rel in info.relations.values() if rel.attname == attname),
+            (rel.name for rel in owner.relations.values() if rel.attname == column),
             "",
         )
         if not relation:
             continue
-        verdict = _base(site, ID_ONLY, relation, Rows(0, UNKNOWN))
+        verdict = _base(
+            site,
+            ID_ONLY,
+            f"{prefix}__{relation}" if prefix else relation,
+            Rows(0, UNKNOWN),
+        )
         verdict.headline = f"{attname} is already on the row; nothing to do"
         out.append(verdict)
 
     return out
 
 
-def _prefetch_only(info, relation: str) -> bool:
-    """Whether a hint for this relation has to be prefetch_related().
+def _prefetch_only(vocabulary, label: str, path: str) -> bool:
+    """Whether a hint for this path has to be prefetch_related().
 
-    Read off the relation kind rather than guessed: select_related() raises
-    FieldError on a reverse many-to-one and on a many-to-many, and the one
-    reverse relation Django *can* join is a one-to-one.
+    Decided by every hop, not by the last one.  select_related() raises
+    FieldError on a reverse many-to-one and on a many-to-many wherever they
+    appear along the path, so `club__books__publisher` needs a batch even
+    though it ends at a forward FK that a join would carry happily.  The one
+    reverse relation Django *can* join is a one-to-one, which is why this is
+    read off `Relation.joinable` rather than off the direction.
+
+    prefetch_related() takes `__` paths too, so there is always a hint to
+    offer; the question is only which.
     """
-    described = info.relation(relation) if info is not None else None
-    return bool(described is not None and described.manager)
+    hops = vocabulary.resolve_hops(label, path) if vocabulary is not None else None
+    if not hops:
+        return False
+    return any(not hop.joinable for hop in hops)
 
 
-def _unhinted(site, relation, observed, cardinality, sample_size, info=None) -> Verdict:
+def _unhinted(
+    site, relation, observed, cardinality, sample_size, vocabulary=None
+) -> Verdict:
     rows = _rows(site, relation, observed, cardinality, sample_size)
-    match = observed.get((id(site), relation))
+    found = observed.get((id(site), relation))
     kind = N_PLUS_ONE if rows.n > 1 else EXTRA_QUERY
     verdict = _base(site, kind, relation, rows)
     verdict.actionable = True
-    if match is not None:
-        verdict.confidence = match.confidence
-        verdict.observed_queries = match.group.count
-        verdict.observed_seconds = match.group.total_seconds
-        verdict.source = match.group.source
-        if not match.by_table:
+    hops = 1
+    if found is not None:
+        verdict.confidence = found.primary.confidence
+        # Queries are summed and rows are not: a two-hop chain goes back to
+        # the database twice for every row it read.
+        verdict.observed_queries = found.queries
+        # Per invocation, beside a per-invocation N: the report prints both in
+        # the same "what this costs one call" row.
+        verdict.observed_seconds = found.seconds
+        verdict.observed_invocations = found.invocations
+        verdict.source = found.primary.group.source
+        hops = found.hops
+        if not found.primary.by_table:
             verdict.notes = verdict.notes + (
                 "matched on the enclosing scope only; the table did not confirm it",
             )
-    prefetch = _prefetch_only(info, relation)
-    verdict.headline = (
-        f"{rows.n} extra queries, one per row"
-        if kind == N_PLUS_ONE
-        else (
-            "one extra query, and a batch would carry it"
-            if prefetch
-            else "one extra query, and a join would carry it for free"
+    prefetch = _prefetch_only(vocabulary, site.model, relation)
+    if kind == N_PLUS_ONE and hops > 1:
+        # One hint removes the whole chain, so this is one finding -- but it
+        # must not quote one hop's traffic as the cost of all of them.
+        headline = (
+            f"{verdict.observed_queries} extra queries, "
+            f"{hops} per row across {relation.replace('__', ' -> ')}"
         )
-    )
+    elif kind == N_PLUS_ONE:
+        headline = f"{rows.n} extra queries, one per row"
+    elif prefetch:
+        headline = "one extra query, and a batch would carry it"
+    else:
+        headline = "one extra query, and a join would carry it for free"
+    verdict.headline = headline
     fit(verdict, prefetch=prefetch)
     _soften(verdict, site)
     return verdict
 
 
-def _prefetched(site, relation, observed, cardinality, sample_size) -> Verdict:
+def _prefetched(
+    site, relation, observed, cardinality, sample_size, hint: str = ""
+) -> Verdict:
     rows = _rows(site, relation, observed, cardinality, sample_size)
     stats = cardinality(site.model, relation) if cardinality else None
+    # The hint as it is written in the source, which is what the reader has to
+    # find and change; `relation` is the path that was touched, and the two
+    # differ whenever a deeper hint covers a shallower touch.
+    hint = hint or relation
     if stats is not None and stats.counted and not stats.batches_well:
-        verdict = _base(site, SWITCH_TO_SELECT, relation, rows)
+        verdict = _base(site, SWITCH_TO_SELECT, hint, rows)
         verdict.actionable = True
         verdict.headline = (
-            f'prefetch_related("{relation}") returns '
+            f'prefetch_related("{hint}") returns '
             f"{stats.distinct_ratio:.0%} as many rows as the parent query; "
             "a join carries them for free"
         )
@@ -867,14 +1077,14 @@ def _prefetched(site, relation, observed, cardinality, sample_size) -> Verdict:
         _soften(verdict, site)
         return verdict
 
-    verdict = _base(site, KEEP_PREFETCH, relation, rows)
+    verdict = _base(site, KEEP_PREFETCH, hint, rows)
     if stats is not None and stats.counted:
         verdict.headline = (
-            f'prefetch_related("{relation}") is the right hint: '
+            f'prefetch_related("{hint}") is the right hint: '
             f"{stats.present} rows share {stats.distinct} targets"
         )
     else:
-        verdict.headline = f'prefetch_related("{relation}") covers this touch'
+        verdict.headline = f'prefetch_related("{hint}") covers this touch'
         verdict.notes = verdict.notes + (
             "not counted, so prefetch was not compared against a join",
         )

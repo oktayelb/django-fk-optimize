@@ -428,3 +428,206 @@ def listing():
     )
 
     assert report.sites == []
+
+
+# -- relation paths ----------------------------------------------------
+#
+# `book.publisher.country.name` is two queries per row, not one, and the fix
+# for it is one select_related("publisher__country").  Reading only the first
+# hop printed half a fix -- and once that half was applied the site reported
+# itself as fine while the second N+1 went on running.
+
+
+def test_a_chain_through_two_relations_is_one_path(vocabulary):
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.all():\n    print(book.author.mentor.name)\n",
+    )
+
+    # Every prefix, because a recorded N+1 may be on either hop and the
+    # runtime half confirms them one at a time.
+    assert site.touched == ("author", "author__mentor")
+    # One finding, because one hint settles both hops.
+    assert site.missing == ("author__mentor",)
+
+
+def test_a_third_hop_is_followed_too(vocabulary):
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.all():\n"
+        "    print(book.author.mentor.favourite_publisher.name)\n",
+    )
+
+    assert site.touched == (
+        "author",
+        "author__mentor",
+        "author__mentor__favourite_publisher",
+    )
+    assert site.missing == ("author__mentor__favourite_publisher",)
+
+
+def test_half_a_fix_does_not_silence_the_other_half(vocabulary):
+    """The bug this was written for: select_related("author") loads the
+    author and leaves `author.mentor` a query per row."""
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.select_related('author'):\n"
+        "    print(book.author.mentor.name)\n",
+    )
+
+    assert site.missing == ("author__mentor",)
+    assert site.unused == (), "the hint is used; it just does not go far enough"
+
+
+def test_a_deeper_hint_covers_the_hop_it_passes_through(vocabulary):
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.select_related('author__mentor'):\n"
+        "    print(book.author.mentor.name)\n",
+    )
+
+    assert site.touched == ("author", "author__mentor")
+    assert site.missing == ()
+    assert site.unused == ()
+
+
+def test_a_deeper_hint_than_the_site_needs_is_not_called_unused(vocabulary):
+    """Over-reporting here tells someone to delete a join they need."""
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.select_related('author__mentor'):\n"
+        "    print(book.author.name)\n",
+    )
+
+    assert site.unused == ()
+    assert site.missing == ()
+
+
+def test_a_hint_no_path_overlaps_is_still_unused(vocabulary):
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.select_related('publisher'):\n"
+        "    print(book.author.mentor.name)\n",
+    )
+
+    assert site.unused == ("publisher",)
+
+
+def test_a_manager_ends_the_path(vocabulary):
+    """`book.tags.first().name` reads a row this queryset never loaded."""
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.all():\n    print(book.tags.first().name)\n",
+    )
+
+    assert site.touched == ()
+    assert site.bypassed == ("tags",)
+    assert not any("__" in name for name in site.touched + site.bypassed)
+
+
+def test_a_manager_at_the_end_of_a_path_is_classified_as_one(vocabulary):
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.all():\n"
+        "    print(list(book.author.proteges.all()))\n",
+    )
+
+    assert site.touched == ("author", "author__proteges")
+    assert site.missing == ("author__proteges",)
+
+
+def test_a_manager_read_but_not_consumed_is_free_at_depth_too(vocabulary):
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.all():\n    register(book.author.proteges)\n",
+    )
+
+    assert site.touched == ("author",)
+    assert site.free == ("author__proteges",)
+
+
+def test_a_column_attribute_deeper_in_a_path_is_still_free(vocabulary):
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.all():\n    print(book.author.mentor_id)\n",
+    )
+
+    assert site.touched == ("author",), "the author itself is a query"
+    assert site.id_only == ("author__mentor_id",)
+    assert site.missing == ("author",)
+
+
+def test_the_walk_stops_where_the_vocabulary_does():
+    """A hop over the edge of the vocabulary is not a guess to be made."""
+    from django_fk_optimize.utils import ModelInfo, Relation, Vocabulary
+
+    book = ModelInfo(
+        label="testapp.Book",
+        name="Book",
+        module="tests.testapp.models",
+        relations={"publisher": Relation("publisher", "publisher_id", "other.Press")},
+    )
+    site = only_site(
+        Vocabulary(models={"testapp.Book": book}),
+        "for book in Book.objects.all():\n    print(book.publisher.country.name)\n",
+    )
+
+    assert site.touched == ("publisher",)
+
+
+def test_covers_reads_a_path_in_one_direction_only():
+    from django_fk_optimize.utils import Hints
+
+    deep = Hints(select=("publisher__country",))
+    assert deep.covers("publisher__country")
+    assert deep.covers("publisher"), "the join passes through the publisher"
+
+    shallow = Hints(select=("publisher",))
+    assert shallow.covers("publisher")
+    assert not shallow.covers("publisher__country"), (
+        "select_related() stops where it was told to stop"
+    )
+    assert not shallow.covers("publisher_of_record"), "a prefix is not a hop"
+
+
+def test_missing_keeps_only_the_deepest_uncovered_path():
+    from django_fk_optimize.utils import CallSite
+    from django_fk_optimize.utils.callsites import ITERATION
+
+    site = CallSite(
+        path="views.py",
+        line=1,
+        model="testapp.Book",
+        kind=ITERATION,
+        expression="Book.objects.all()",
+        touched=("author", "author__mentor", "publisher"),
+    )
+
+    assert site.missing == ("author__mentor", "publisher")
+
+
+def test_assigning_a_relation_is_not_touching_it(vocabulary):
+    """Setting an FK issues no query; it is how people *avoid* one.
+
+    Misago writes `poll.category = thread.category` precisely so that nothing
+    has to be loaded, and calling that an N+1 tells someone to fix a query
+    that was never made.
+    """
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.all():\n    book.publisher = a_publisher\n",
+    )
+
+    assert site.touched == ()
+    assert site.missing == ()
+
+
+def test_a_write_at_the_end_of_a_path_does_not_extend_it(vocabulary):
+    """`post.thread.category = x` reads the thread and writes the category."""
+    site = only_site(
+        vocabulary,
+        "for book in Book.objects.all():\n    book.author.mentor = someone\n",
+    )
+
+    assert site.touched == ("author",)
+    assert site.missing == ("author",)

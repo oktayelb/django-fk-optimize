@@ -274,3 +274,72 @@ def test_a_real_lead_is_left_alone():
     assert result.ranked()[0][0] is FieldOperation.PREFETCH_RELATED, (
         "a nine-fold win is evidence, and fewer queries must not override it"
     )
+
+
+# -- paths -------------------------------------------------------------
+
+
+def test_a_path_is_planned_as_one_hint_over_every_hop():
+    """`publisher__country` is what the hint takes; `publisher` is what a row has."""
+    from tests.testapp.models import Book
+
+    plan = plan_named(Book, "author__mentor")
+
+    assert plan.name == "author__mentor", "the hint takes the whole path"
+    assert plan.accessor == "author", "getattr() on a Book can only ask for the first"
+    assert [hop.accessor for hop in plan.chain] == ["author", "mentor"]
+    assert plan.kind == bench.FORWARD
+    assert plan.can_select_related is True
+
+
+def test_a_single_relation_is_still_its_own_only_hop():
+    from tests.testapp.models import Book
+
+    plan = plan_named(Book, "publisher")
+
+    assert plan.hops == ()
+    assert plan.chain == (plan,), "so callers walk one shape, not two"
+
+
+def test_a_manager_anywhere_along_a_path_rules_out_the_join(library):
+    """One m2m hop makes select_related() illegal for the whole path."""
+    from tests.testapp.models import Club
+
+    plan = plan_named(Club, "books__publisher")
+
+    assert plan is not None
+    assert plan.kind == bench.FORWARD, "the last hop really is a forward FK"
+    assert plan.can_select_related is False, (
+        "and Django still refuses to join through the many-to-many before it"
+    )
+    with pytest.raises(FieldError):
+        list(Club.objects.select_related("books__publisher")[:1])
+
+
+def test_a_path_that_does_not_exist_is_not_half_a_plan():
+    from tests.testapp.models import Book
+
+    assert plan_named(Book, "publisher__nosuchrelation") is None
+    assert plan_named(Book, "nosuchrelation__publisher") is None
+
+
+def test_timing_a_path_provokes_every_hop_not_just_the_first(library):
+    """The number reported for a two-hop chain has to be the two-hop number.
+
+    Touching only `author` would time nine queries and the report would quote
+    that for a loop that really costs seventeen -- and then claim the join
+    saved nine of them.
+    """
+    from tests.testapp.models import Book
+
+    plan = plan_named(Book, "author__mentor")
+    timer = Benchmark(sample_size=12, repeat=1)
+
+    vanilla = timer.measure(Book, [plan])
+    selected = timer.measure(Book, [plan], select=[plan.name])
+
+    # 12 books: 3 have no author at all, so 9 author lookups; of those nine
+    # authors one is the mentor of all the rest and has no mentor itself, so
+    # 8 mentor lookups. A null relation is not a query.
+    assert vanilla.queries == 1 + 9 + 8
+    assert selected.queries == 1

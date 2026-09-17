@@ -107,8 +107,25 @@ class Hints:
     prefetch: tuple[str, ...] = ()
     opaque: bool = False  # a hint whose arguments were not literals
 
-    def covers(self, name: str) -> bool:
-        return name in self.select or name in self.prefetch
+    def covers(self, path: str) -> bool:
+        """Whether some hint here already loads the relation at `path`.
+
+        Only one direction is true, and it is the surprising one.  A *deeper*
+        hint covers a shallower path -- select_related("publisher__country")
+        joins the publisher on its way to the country, so the `publisher` hop
+        costs nothing extra.  A shallower hint covers nothing: after
+        select_related("publisher") the publisher is on the row and
+        `publisher.country` is still a query per row.
+
+        Reading a prefix as coverage is what made a half-applied fix read as a
+        clean site forever: the first hop gets hinted, the site stops being
+        reported, and the second N+1 outlives the report that was supposed to
+        find it.
+        """
+        return any(
+            hint == path or hint.startswith(path + "__")
+            for hint in tuple(self.select) + tuple(self.prefetch)
+        )
 
     def __bool__(self):
         return bool(self.select or self.prefetch or self.opaque)
@@ -187,19 +204,45 @@ class CallSite:
 
     @property
     def missing(self) -> tuple[str, ...]:
-        """Relations this site touches with no hint covering them."""
-        return tuple(name for name in self.touched if not self.hints.covers(name))
+        """The deepest uncovered paths this site reaches through.
+
+        `touched` holds every prefix, so a site that reads
+        `book.publisher.country.name` has `publisher` and `publisher__country`
+        uncovered at once -- and reporting both would ask for two hints where
+        select_related("publisher__country") already joins both tables.  A path
+        that something deeper extends is therefore dropped: one finding, one
+        fix, and never two verdicts where one hint settles both.
+        """
+        uncovered = [path for path in self.touched if not self.hints.covers(path)]
+        return tuple(
+            path
+            for path in uncovered
+            if not any(other.startswith(path + "__") for other in uncovered)
+        )
 
     @property
     def unused(self) -> tuple[str, ...]:
-        """Hints for relations this site never touches -- a join for nothing."""
+        """Hints for relations this site never touches -- a join for nothing.
+
+        A hint counts as used when any path this site reaches meets it in
+        *either* direction: select_related("publisher") is used by a site that
+        reads `publisher.country`, and select_related("publisher__country") is
+        used by one that only reads `publisher`.  Only a hint nothing overlaps
+        at all is reported.
+
+        The asymmetry with `missing` is deliberate.  Over-reporting here tells
+        someone to delete a join they need, and they will believe it;
+        under-reporting only means the tool stays quiet about a join that costs
+        one extra column.  Those are not the same mistake.
+        """
         if self.escapes or self.hints.opaque:
             return ()
+        reached = tuple(self.touched) + tuple(self.bypassed)
         hinted = tuple(self.hints.select) + tuple(self.hints.prefetch)
         return tuple(
-            name
-            for name in hinted
-            if name not in self.touched and name not in self.bypassed
+            hint
+            for hint in hinted
+            if not any(_overlaps(hint, path) for path in reached)
         )
 
 
@@ -339,7 +382,7 @@ class _Scanner:
             self._statement(node, scope, instances, scope_info)
 
         for name, (binding, origin) in instances.items():
-            reached = _touches(body, name, binding.model)
+            reached = _touches(body, name, binding.model, self.vocabulary)
             touched, id_only, escapes = (
                 reached.touched,
                 reached.id_only,
@@ -447,7 +490,7 @@ class _Scanner:
             )
 
     def _record_iteration(self, origin, varname, binding, body, scope_info):
-        reached = _touches(body, varname, binding.model)
+        reached = _touches(body, varname, binding.model, self.vocabulary)
         touched, id_only, escapes = (
             reached.touched,
             reached.id_only,
@@ -568,6 +611,11 @@ class _Scanner:
 # ----------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------
+
+
+def _overlaps(one: str, other: str) -> bool:
+    """Whether two relation paths meet -- same path, or one inside the other."""
+    return one == other or one.startswith(other + "__") or other.startswith(one + "__")
 
 
 def _end_line(node, default=0):
@@ -713,34 +761,95 @@ class Touches:
     escapes: bool = False
 
 
-def _touches(nodes, varname, info) -> Touches:
-    """Relations of `info` reached through `varname` anywhere in `nodes`."""
+def _chain(node, info, vocabulary, parents):
+    """Classify one attribute chain hanging off a row, hop by hop.
+
+    Yields (bucket, path) in Django's own `__` spelling.  A touch is a *path*
+    and not a name because `book.publisher.country.name` is two queries per row
+    and one `select_related("publisher__country")` settles both, while the
+    `select_related("publisher")` the shallow read used to produce fixes half
+    of it and then reports the site as fine for ever after.
+
+    Every prefix is yielded as well as the full path: a recorded N+1 may be on
+    any hop, and the runtime half confirms one hop at a time by the table it
+    queried.
+
+    The walk stops at the first hop that is not a relation, at a target model
+    this vocabulary cannot name -- a guessed hop is worse than a short path --
+    and at a manager, which ends the chain of instances: whatever
+    `book.tags.first().name` reads belongs to a row no join can reach from
+    here.
+    """
+    path: list[str] = []
+    current = info
+    while True:
+        if not isinstance(node.ctx, ast.Load):
+            # `post.thread.category = post.category` reads `post.thread` and
+            # then *writes* the category: assigning a relation issues no query,
+            # so the hop being assigned is not a touch and nothing can be
+            # chained off it.  Misago has this exact line, and counting it made
+            # up an N+1 that does not exist.
+            return
+
+        relation = current.relation(node.attr)
+        if relation is None:
+            if node.attr in current.attnames:
+                # `alarm.type_id` is already in the row.  Recorded so the
+                # report can say "you are fine" rather than say nothing.
+                yield "id_only", "__".join(path + [node.attr])
+            return
+
+        path.append(relation.name)
+        reached = "__".join(path)
+        if getattr(relation, "manager", False):
+            methods = _manager_chain(node, parents)
+            if not methods:
+                yield "free", reached
+            elif all(method in PREFETCH_SERVED for method in methods):
+                yield "touched", reached
+            else:
+                yield "bypassed", reached
+            return
+
+        yield "touched", reached
+        parent = parents.get(id(node))
+        if not (isinstance(parent, ast.Attribute) and parent.value is node):
+            return
+        current = _model(vocabulary, relation.target)
+        if current is None:
+            return
+        node = parent
+
+
+def _model(vocabulary, label):
+    return vocabulary.models.get(label) if vocabulary is not None else None
+
+
+def _touches(nodes, varname, info, vocabulary=None) -> Touches:
+    """Relation paths of `info` reached through `varname` anywhere in `nodes`.
+
+    `vocabulary` is what makes a chain longer than one hop readable: the model
+    on the far side of a relation has to be named before the next attribute
+    means anything.  Without one the walk is exactly the single-hop scan this
+    used to be.
+    """
     touched, id_only, free, bypassed = [], [], [], []
     escapes = False
     parents = _parents(nodes)
+    buckets = {
+        "touched": touched,
+        "id_only": id_only,
+        "free": free,
+        "bypassed": bypassed,
+    }
 
     for node in nodes:
         for sub in ast.walk(node):
             if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name):
                 if sub.value.id != varname:
                     continue
-                relation = info.relation(sub.attr)
-                if relation is None:
-                    if sub.attr in info.attnames:
-                        # alarm.type_id is already in the row. Recorded so the
-                        # report can say "you are fine" rather than say nothing.
-                        id_only.append(sub.attr)
-                    continue
-                if not getattr(relation, "manager", False):
-                    touched.append(sub.attr)
-                    continue
-                chain = _manager_chain(sub, parents)
-                if not chain:
-                    free.append(sub.attr)
-                elif all(method in PREFETCH_SERVED for method in chain):
-                    touched.append(sub.attr)
-                else:
-                    bypassed.append(sub.attr)
+                for bucket, path in _chain(sub, info, vocabulary, parents):
+                    buckets[bucket].append(path)
             elif isinstance(sub, ast.Call):
                 for arg in list(sub.args) + [kw.value for kw in sub.keywords]:
                     if isinstance(arg, ast.Name) and arg.id == varname:
