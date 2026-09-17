@@ -51,7 +51,7 @@ from ...analysis.report import Coverage, render_text
 from ...analysis.verdicts import Costed, Tables, build, cost, reconcile
 from ...recording import store
 from ...utils.callsites import PROBABLE, RESOLVED, scan_files
-from ...utils.sources import discover
+from ...utils.sources import app_in_scope, discover, is_third_party
 from ...utils.vocabulary import Vocabulary
 
 __all__ = [
@@ -206,7 +206,21 @@ class Command(BaseCommand):
         parser.add_argument(
             "--include-django",
             action="store_true",
-            help="include django's own and third-party apps.",
+            help=(
+                "include django's own apps (django.*). Installed third-party "
+                "packages are a separate switch: --include-third-party. "
+                "Default: off."
+            ),
+        )
+        parser.add_argument(
+            "--include-third-party",
+            action="store_true",
+            help=(
+                "include apps installed from site-packages -- DRF, allauth, "
+                "wagtail. Off, because their querysets are not yours to "
+                "change. An editable install is your code and is always "
+                "scanned. Default: off."
+            ),
         )
         parser.add_argument(
             "--django-models",
@@ -241,20 +255,32 @@ class Command(BaseCommand):
 
     # -- selection ------------------------------------------------------
 
-    def _select_models(self, selection: str | None, include_django: bool):
+    def _select_models(
+        self,
+        selection: str | None,
+        include_django: bool,
+        include_third_party: bool = False,
+    ):
+        """The models this run is about.
+
+        Scope is decided by `sources.app_in_scope` rather than here, so that
+        the models reported on and the files scanned for call sites can never
+        disagree about whose code this is -- a report that names a model the
+        scan was not allowed to read has no call site to offer for it.
+
+        A selection names an app or a model outright, and that wins: somebody
+        who types the label of an installed app has already said they mean it.
+        """
         model_s: list[type[Model]] = []
         try:
             if selection is None:
                 model_s = list(apps.get_models())
-                if not include_django:
-                    local_apps = {
-                        ac.label
-                        for ac in apps.get_app_configs()
-                        if not ac.name.startswith("django.")
-                    }
-                    model_s = [
-                        mdl for mdl in model_s if mdl._meta.app_label in local_apps
-                    ]
+                local_apps = {
+                    ac.label
+                    for ac in apps.get_app_configs()
+                    if app_in_scope(ac, include_django, include_third_party)
+                }
+                model_s = [mdl for mdl in model_s if mdl._meta.app_label in local_apps]
             elif "." in selection:
                 model_s.append(apps.get_model(selection))
             else:
@@ -285,7 +311,11 @@ class Command(BaseCommand):
             )
             include_django = True
 
-        model_s = self._select_models(options["app.model"], include_django)
+        include_third_party = options["include_third_party"]
+
+        model_s = self._select_models(
+            options["app.model"], include_django, include_third_party
+        )
         if not model_s:
             self.stdout.write(
                 "No model found with a relation. "
@@ -297,7 +327,29 @@ class Command(BaseCommand):
         if not options["callsites"]:
             self._sweep(model_s, deadline)
             return
-        self._report(model_s, deadline, include_django, options)
+        self._report(
+            model_s,
+            deadline,
+            include_django,
+            self._scans_installed(options["app.model"], model_s, include_third_party),
+            options,
+        )
+
+    def _scans_installed(self, selection, model_s, include_third_party) -> bool:
+        """Should the scan read installed packages, and not only the project?
+
+        When asked to, and when the run was narrowed to an app that lives in
+        one.  Typing `fk_optimize allauth` is as explicit as a flag, and a run
+        that selected that app's models and then refused to open its files
+        would report no call sites for it -- a clean bill of health for source
+        nothing ever read, which is worse than the noise this default removes.
+        """
+        if include_third_party:
+            return True
+        if selection is None:
+            return False
+        labels = {model._meta.app_label for model in model_s}
+        return any(is_third_party(apps.get_app_config(label).path) for label in labels)
 
     # -- the verdict report ---------------------------------------------
 
@@ -305,7 +357,7 @@ class Command(BaseCommand):
         given = options["recording"]
         return Path(given) if given else conf.recording_path()
 
-    def _report(self, model_s, deadline, include_django, options):
+    def _report(self, model_s, deadline, include_django, scan_third_party, options):
         labels = {model._meta.label for model in model_s}
         by_label = {model._meta.label: model for model in apps.get_models()}
 
@@ -314,7 +366,7 @@ class Command(BaseCommand):
 
         # Every project file is scanned even when the report is narrowed to one
         # model: the call site that iterates it is very often in another app.
-        packages = dict(discover(include_django))
+        packages = dict(discover(include_django, scan_third_party))
         scan = scan_files(packages, vocabulary, package_for=packages.get)
         sites = [site for site in scan.sites if site.model in labels]
 

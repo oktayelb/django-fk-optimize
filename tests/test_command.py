@@ -8,6 +8,7 @@ thirteen queries into one on any machine on any day.
 import io
 import json
 import re
+from pathlib import Path
 
 import pytest
 from django.core.management import call_command
@@ -621,3 +622,67 @@ def test_an_unnameable_runtime_finding_respects_the_narrowing(library, tmp_path)
 
     assert "people()" not in output
     assert "no change worth making" in output
+
+
+# -- whose code the run is about ---------------------------------------
+#
+# The test app stands in for an installed one: its path is moved under a
+# directory named site-packages, which is what pip would really have done to
+# it, and the flags are asserted against a real end-to-end run.
+
+
+@pytest.fixture
+def installed_testapp(monkeypatch, tmp_path):
+    """Make `tests.testapp` look like a package somebody pip-installed.
+
+    A symlink rather than a copy, so the app the registry, the scanner and the
+    ORM are all looking at stays the one the rest of the suite uses -- only
+    where it appears to live changes.
+    """
+    from django.apps.registry import apps
+
+    config = apps.get_app_config("testapp")
+    vendor = tmp_path / "site-packages"
+    vendor.mkdir()
+    (vendor / "testapp").symlink_to(Path(config.path), target_is_directory=True)
+    monkeypatch.setattr(config, "path", str(vendor / "testapp"))
+    return vendor / "testapp"
+
+
+def whole_project(*args, **options):
+    """A run with no selection: whatever the flags say is in scope."""
+    return run("--repeat", "1", "--sample-size", "12", *args, **options)
+
+
+def test_an_installed_app_is_not_reported_on_by_default(installed_testapp, library):
+    output = whole_project("--recording", "absent.jsonl")
+
+    assert "testapp.Book.publisher" not in output
+    assert "No model found with a relation" in output
+
+
+def test_include_third_party_brings_the_installed_app_back(installed_testapp, library):
+    output = whole_project("--recording", "absent.jsonl", "--include-third-party")
+
+    assert "testapp.Book.publisher" in output
+
+
+def test_include_django_does_not_reach_an_installed_app(installed_testapp, library):
+    """The two flags are separate switches, not one in two strengths."""
+    output = whole_project("--recording", "absent.jsonl", "--include-django")
+
+    assert "testapp.Book.publisher" not in output
+
+
+def test_naming_an_installed_app_scans_it(installed_testapp, library):
+    """An explicit selection is as explicit as the flag.
+
+    Selecting the app and then declining to open its files would report no
+    call sites for it, which reads as a clean bill of health for source the
+    run never looked at.
+    """
+    output = run(
+        "testapp", "--repeat", "1", "--sample-size", "12", "--recording", "absent.jsonl"
+    )
+
+    assert "testapp.Book.publisher" in output
