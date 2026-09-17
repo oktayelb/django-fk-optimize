@@ -606,6 +606,320 @@ def test_missing_keeps_only_the_deepest_uncovered_path():
     assert site.missing == ("author__mentor", "publisher")
 
 
+# -- querysets a class hands its own methods ---------------------------
+#
+# A DRF viewset's `queryset`, a class-based view's `get_queryset()` and a plain
+# `self.books` set in one method and read in another are between them most of
+# the Django written since 2013, and all three used to scan to nothing at all:
+# the queryset and the loop that consumes it are simply in different scopes.
+
+
+def test_a_class_attribute_queryset_is_reachable_from_a_method(vocabulary):
+    site = only_site(
+        vocabulary,
+        """
+from tests.testapp.models import Book
+
+
+class BookViewSet:
+    queryset = Book.objects.all()
+
+    def listing(self):
+        for book in self.queryset:
+            send(book.publisher.name)
+""",
+        header="",
+    )
+
+    assert site.model == "testapp.Book"
+    assert site.touched == ("publisher",)
+    # The chain itself resolved, and a class attribute is not overridable
+    # halfway through a request.
+    assert site.confidence == RESOLVED
+    assert any("class attribute queryset" in note for note in site.notes)
+
+
+def test_an_annotated_class_attribute_is_the_same_declaration(vocabulary):
+    site = only_site(
+        vocabulary,
+        """
+from tests.testapp.models import Book
+
+
+class BookViewSet:
+    queryset: object = Book.objects.select_related("publisher")
+
+    def listing(self):
+        for book in self.queryset:
+            send(book.publisher.name)
+""",
+        header="",
+    )
+
+    assert site.hints.select == ("publisher",)
+    assert site.missing == ()
+
+
+def test_a_queryset_returning_method_is_followed_at_probable(vocabulary):
+    site = only_site(
+        vocabulary,
+        """
+from tests.testapp.models import Book
+
+
+class BookList:
+    def get_queryset(self):
+        return Book.objects.all()
+
+    def render(self):
+        for book in self.get_queryset():
+            send(book.publisher.name)
+""",
+        header="",
+    )
+
+    assert site.touched == ("publisher",)
+    # get_queryset() is the most overridden method in Django, and the subclass
+    # that overrides it is usually in a file this scan never reads.
+    assert site.confidence == PROBABLE
+    assert any("subclass can override" in note for note in site.notes)
+
+
+def test_the_chain_continues_off_a_class_binding(vocabulary):
+    site = only_site(
+        vocabulary,
+        """
+from tests.testapp.models import Book
+
+
+class BookList:
+    def get_queryset(self):
+        return Book.objects.all()
+
+    def render(self):
+        for book in self.get_queryset().select_related("publisher")[:20]:
+            send(book.publisher.name)
+""",
+        header="",
+    )
+
+    assert site.hints.select == ("publisher",)
+    assert site.missing == ()
+    assert site.bound == 20
+
+
+def test_an_attribute_assigned_in_one_method_is_read_in_another(vocabulary):
+    site = only_site(
+        vocabulary,
+        """
+from tests.testapp.models import Book
+
+
+class Listing:
+    def load(self):
+        self.books = Book.objects.filter(title="x")
+
+    def render(self):
+        for book in self.books:
+            send(book.publisher.name)
+""",
+        header="",
+    )
+
+    assert site.touched == ("publisher",)
+    assert site.confidence == RESOLVED
+    assert any("assigned in load()" in note for note in site.notes)
+
+
+def test_a_classmethod_reaches_the_same_attribute(vocabulary):
+    site = only_site(
+        vocabulary,
+        """
+from tests.testapp.models import Book
+
+
+class BookViewSet:
+    queryset = Book.objects.all()
+
+    @classmethod
+    def listing(cls):
+        for book in cls.queryset:
+            send(book.publisher.name)
+""",
+        header="",
+    )
+
+    assert site.touched == ("publisher",)
+
+
+def test_a_class_binding_does_not_leak_to_the_next_class(vocabulary):
+    """Cross-class resolution is exactly the guess this scanner refuses."""
+    report = scan(
+        vocabulary,
+        """
+from tests.testapp.models import Book
+
+
+class First:
+    queryset = Book.objects.all()
+
+
+class Second:
+    def listing(self):
+        for book in self.queryset:
+            send(book.publisher.name)
+""",
+        header="",
+    )
+
+    assert report.sites == []
+
+
+def test_a_method_that_does_not_always_return_a_queryset_is_not_followed(
+    vocabulary,
+):
+    """One branch returning a list makes the whole method a guess."""
+    report = scan(
+        vocabulary,
+        """
+from tests.testapp.models import Book
+
+
+class BookList:
+    def get_queryset(self):
+        if self.empty:
+            return []
+        return Book.objects.all()
+
+    def render(self):
+        for book in self.get_queryset():
+            send(book.publisher.name)
+""",
+        header="",
+    )
+
+    assert report.sites == []
+
+
+def test_a_method_returning_two_models_is_not_followed(vocabulary):
+    report = scan(
+        vocabulary,
+        """
+from tests.testapp.models import Author, Book
+
+
+class Listing:
+    def get_queryset(self):
+        if self.authors:
+            return Author.objects.all()
+        return Book.objects.all()
+
+    def render(self):
+        for row in self.get_queryset():
+            send(row.publisher.name)
+""",
+        header="",
+    )
+
+    assert report.sites == []
+
+
+def test_branches_that_hint_differently_are_opaque_not_guessed(vocabulary):
+    """Which hint this site got depends on which branch ran, so no relation
+    can be called covered and none can be called an unused join."""
+    site = only_site(
+        vocabulary,
+        """
+from tests.testapp.models import Book
+
+
+class BookList:
+    def get_queryset(self):
+        if self.full:
+            return Book.objects.select_related("publisher")
+        return Book.objects.all()
+
+    def render(self):
+        for book in self.get_queryset():
+            send(book.publisher.name)
+""",
+        header="",
+    )
+
+    assert site.hints.opaque is True
+    assert site.unused == ()
+    assert any("hints differently" in note for note in site.notes)
+
+
+def test_a_nested_functions_return_is_not_the_methods_return(vocabulary):
+    report = scan(
+        vocabulary,
+        """
+from tests.testapp.models import Book
+
+
+class Listing:
+    def get_queryset(self):
+        def inner():
+            return Book.objects.all()
+
+        return [inner]
+
+    def render(self):
+        for book in self.get_queryset():
+            send(book.publisher.name)
+""",
+        header="",
+    )
+
+    assert report.sites == []
+
+
+def test_an_instance_attribute_is_not_followed_across_methods(vocabulary):
+    """`self.book` is one row this class may never have loaded here."""
+    report = scan(
+        vocabulary,
+        """
+from tests.testapp.models import Book
+
+
+class Detail:
+    def load(self):
+        self.book = Book.objects.get(pk=1)
+
+    def render(self):
+        send(self.book.publisher.name)
+""",
+        header="",
+    )
+
+    assert report.sites == []
+
+
+def test_tuple_assignment_binds_element_wise(vocabulary):
+    site = only_site(
+        vocabulary,
+        "books, count = Book.objects.all(), 1\n"
+        "for book in books:\n"
+        "    print(book.publisher.name)\n",
+    )
+
+    assert site.model == "testapp.Book"
+    assert site.touched == ("publisher",)
+
+
+def test_an_unpacked_call_binds_nothing(vocabulary):
+    """Which element a name receives is a runtime fact there."""
+    report = scan(
+        vocabulary,
+        "books, count = paginate(Book.objects.all())\n"
+        "for book in books:\n"
+        "    print(book.publisher.name)\n",
+    )
+
+    assert report.sites == []
+
+
 def test_assigning_a_relation_is_not_touching_it(vocabulary):
     """Setting an FK issues no query; it is how people *avoid* one.
 

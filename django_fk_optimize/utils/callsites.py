@@ -324,6 +324,11 @@ class _Scanner:
         }
         self._aliases: dict[str, object] = {}
         self._opaque: set[str] = set()
+        # Querysets the enclosing class hands its own methods, keyed by how
+        # they are reached: ("attr", "queryset") for `self.queryset`,
+        # ("call", "get_queryset") for `self.get_queryset()`.  Empty outside a
+        # class body, and saved and restored around each one.
+        self._attributes: dict[tuple[str, str], Binding] = {}
         self._loaded_models()
 
     def _loaded_models(self):
@@ -415,13 +420,21 @@ class _Scanner:
             )
 
     def _statement(self, node, scope, instances, scope_info):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if isinstance(node, ast.ClassDef):
             # A class body is not a function, so it inherits the scope it is
-            # written in; a def -- including a nested one -- starts its own.
-            inner = scope_info
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                inner = _function_scope(node)
-            self._scope_of(node.body, scope, inner)
+            # written in -- but it does own the attributes its methods read off
+            # `self`, and those are collected before any method is walked.
+            outer, self._attributes = self._attributes, {}
+            try:
+                self._class_attributes(node, scope)
+                self._scope_of(node.body, scope, scope_info)
+            finally:
+                self._attributes = outer
+            return
+
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A def -- including a nested one -- starts its own scope.
+            self._scope_of(node.body, scope, _function_scope(node))
             return
 
         if isinstance(node, ast.Assign):
@@ -446,15 +459,102 @@ class _Scanner:
             self._comprehension(sub, scope, scope_info)
 
     def _assign(self, node, scope, instances):
-        binding = self._resolve(node.value, scope)
-        if binding is None or binding is TERMINAL_CHAIN:
-            return
         for target in node.targets:
-            if not isinstance(target, ast.Name):
+            for name, value in _paired(target, node.value):
+                binding = self._resolve(value, scope)
+                if binding is None or binding is TERMINAL_CHAIN:
+                    continue
+                scope[name.id] = binding
+                if binding.kind == INSTANCE:
+                    instances[name.id] = (binding, value)
+
+    # -- what a class hands its own methods -----------------------------
+
+    def _class_attributes(self, node, scope):
+        """Collect the querysets this class's methods can reach off `self`.
+
+        Three shapes account for most Django written since 2013 -- a DRF
+        viewset's `queryset = Book.objects.all()`, a class-based view's
+        `get_queryset()`, and a plain `self.books = ...` set in one method and
+        iterated in another -- and all three scanned to nothing at all before
+        this, because the queryset and the loop that consumes it are in
+        different scopes.  Not one of them needs type inference: the chain is
+        still rooted in a manager this module already resolves, and the only
+        thing that widens is the bookkeeping.
+
+        One pass before the methods are walked, and class attributes before
+        methods within it, so a `get_queryset()` returning
+        `self.queryset.filter(...)` finds the attribute it reads.  Nothing
+        here crosses a class or a module: a base class in another file is
+        precisely the guess this scanner exists not to make.
+        """
+        for statement in node.body:
+            for target, value in _class_assignments(statement):
+                binding = self._queryset(value, scope)
+                if binding is not None:
+                    self._attributes[("attr", target)] = _reached(
+                        binding, f"through the class attribute {target}"
+                    )
+
+        for statement in node.body:
+            if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            scope[target.id] = binding
-            if binding.kind == INSTANCE:
-                instances[target.id] = (binding, node.value)
+            for target, value in _self_assignments(statement):
+                binding = self._queryset(value, scope)
+                if binding is not None:
+                    self._attributes[("attr", target)] = _reached(
+                        binding,
+                        f"through self.{target}, assigned in {statement.name}()",
+                    )
+            binding = self._returned_queryset(statement, scope)
+            if binding is not None:
+                self._attributes[("call", statement.name)] = binding
+
+    def _queryset(self, value, scope) -> Binding | None:
+        """`value` as a queryset binding, or None if it is anything else.
+
+        An instance is refused rather than bound: `self.book` is followed
+        wherever it is touched only within the scope that built it, and
+        pretending otherwise would attribute touches to a row this class may
+        never have loaded.
+        """
+        binding = self._resolve(value, scope)
+        if binding is None or binding is TERMINAL_CHAIN:
+            return None
+        return binding if binding.kind == ITERATION else None
+
+    def _returned_queryset(self, node, scope) -> Binding | None:
+        """The queryset a method always returns, if it always returns one.
+
+        Every return has to resolve, and to the same model, because a method
+        that hands back a queryset down one branch and a list down another is
+        not a queryset-returning method and treating it as one would put
+        touches on rows that never existed.
+
+        The result is PROBABLE whatever the chain inside was: `get_queryset()`
+        is the single most overridden method in Django, and the subclass that
+        overrides it is usually in another file this scan will not read.
+        """
+        bindings = [self._queryset(value, scope) for value in _returns(node)]
+        if not bindings or any(binding is None for binding in bindings):
+            return None
+        if len({binding.model.label for binding in bindings}) != 1:
+            return None
+
+        binding = _reached(
+            bindings[0],
+            f"through self.{node.name}(), which a subclass can override",
+            PROBABLE,
+        )
+        if any(other.hints != binding.hints for other in bindings[1:]):
+            # The branches hint differently, so what this call site ends up
+            # with depends on which one ran.  Opaque says exactly that, and
+            # keeps the report from claiming a relation is already covered.
+            binding.hints = Hints(opaque=True)
+            binding.notes = binding.notes + (
+                f"{node.name}() hints differently on different branches",
+            )
+        return binding
 
     def _loop(self, node, scope, scope_info):
         binding = self._resolve(node.iter, scope)
@@ -558,7 +658,17 @@ class _Scanner:
 
         binding = scope.get(base.id)
         index = 0
-        if binding is None:
+        if binding is not None:
+            binding = Binding(**vars(binding))
+        elif base.id in SELF_NAMES and steps:
+            # `self.queryset`, `self.get_queryset()`, `cls.queryset`: a binding
+            # the enclosing class made, which the chain then continues from.
+            found = self._attributes.get((steps[0][0], steps[0][1]))
+            if found is None:
+                return None
+            binding = Binding(**vars(found))
+            index = 1
+        else:
             info = self._model_from_name(base.id)
             if info is None:
                 return None
@@ -566,8 +676,6 @@ class _Scanner:
                 return None
             binding = Binding(kind=ITERATION, model=info, origin=_source(node))
             index = 1
-        else:
-            binding = Binding(**vars(binding))
 
         for kind, name, step in steps[index:]:
             if kind == "attr":
@@ -612,10 +720,95 @@ class _Scanner:
 # helpers
 # ----------------------------------------------------------------------
 
+# The names a method reaches its own class's attributes through.  Both, because
+# a classmethod is written with `cls` and means the same thing.
+SELF_NAMES = frozenset({"self", "cls"})
+
 
 def _overlaps(one: str, other: str) -> bool:
     """Whether two relation paths meet -- same path, or one inside the other."""
     return one == other or one.startswith(other + "__") or other.startswith(one + "__")
+
+
+def _paired(target, value):
+    """(name, the expression it is bound to) for one assignment target.
+
+    `a = b = qs` gives both names the same chain; `books, count = qs, 1` is
+    element-wise, which is the shape that used to be dropped whole because the
+    target was not a Name.  A starred target or an unpacked call yields
+    nothing: which element a name receives is a runtime fact there, and a
+    scanner that guessed would bind a queryset to a number.
+    """
+    if isinstance(target, (ast.Tuple, ast.List)):
+        if not isinstance(value, (ast.Tuple, ast.List)):
+            return
+        if len(target.elts) != len(value.elts):
+            return
+        if any(isinstance(element, ast.Starred) for element in target.elts):
+            return
+        for element, item in zip(target.elts, value.elts, strict=True):
+            yield from _paired(element, item)
+    elif isinstance(target, ast.Name):
+        yield target, value
+
+
+def _class_assignments(statement):
+    """(attribute name, value) for one statement in a class body."""
+    if isinstance(statement, ast.Assign):
+        for target in statement.targets:
+            for name, value in _paired(target, statement.value):
+                yield name.id, value
+    elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+        # `queryset: QuerySet[Book] = Book.objects.all()` is the same
+        # declaration with a type on it.
+        if isinstance(statement.target, ast.Name):
+            yield statement.target.id, statement.value
+
+
+def _self_assignments(node):
+    """(attribute name, value) for every `self.x = ...` in one method."""
+    for statement in _own_statements(node):
+        if not isinstance(statement, ast.Assign):
+            continue
+        for target in statement.targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id in SELF_NAMES
+            ):
+                yield target.attr, statement.value
+
+
+def _returns(node):
+    """The value of every `return` this function makes itself.
+
+    A nested def's returns belong to the nested def: a method that returns a
+    list and happens to close over a helper returning a queryset is not a
+    queryset-returning method.
+    """
+    for statement in _own_statements(node):
+        if isinstance(statement, ast.Return) and statement.value is not None:
+            yield statement.value
+
+
+def _own_statements(node):
+    """Every statement in a function body except another function's."""
+    stack = list(node.body)
+    while stack:
+        statement = stack.pop(0)
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        yield statement
+        stack.extend(_child_statements(statement))
+
+
+def _reached(binding, note, confidence=None) -> Binding:
+    """A copy of `binding`, saying how this call site got hold of it."""
+    copy = Binding(**vars(binding))
+    copy.notes = copy.notes + (note,)
+    if confidence is not None:
+        copy.confidence = confidence
+    return copy
 
 
 def _end_line(node, default=0):
