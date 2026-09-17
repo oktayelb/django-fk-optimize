@@ -118,9 +118,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The newest python, not the one the rest of the jobs pin. A scanner can
+      # only read the grammar its own interpreter knows, and this job reads
+      # other people's code on their schedule: readthedocs adopted PEP 758
+      # (`except A, B:` without parentheses) and sixteen of its files stopped
+      # parsing under 3.13 overnight, which says nothing about the scanner.
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.13"
+          python-version: "3.14"
 
       - run: python -m pip install "Django>=4.2"
 
@@ -154,9 +159,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Newest python, for the reason `corpus` gives: these are other people's
+      # projects and they adopt new syntax when they please.
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.13"
+          python-version: "3.14"
 
       - name: Install, migrate and report on real projects
         run: python scripts/live.py --json live-report.json
