@@ -1094,6 +1094,221 @@ def test_a_column_attribute_at_the_end_of_a_path_is_recognised(vocabulary, table
     assert only(verdicts, V.EXTRA_QUERY).relation == "author"
 
 
+# ----------------------------------------------------------------------
+# nothing observed may be dropped
+# ----------------------------------------------------------------------
+
+# Two tables none of the sites below touch, so the join matches on scope and
+# the table refuses to confirm it. Nothing has a forward relation to the tag
+# table (Book.tags is a many-to-many, which is a different query shape), and
+# exactly one thing has one to the imprint table -- so the two cover both ends
+# of what `_infer()` can come back with.
+TAGS = "testapp_tag"
+IMPRINTS = "testapp_imprint"
+
+AMBIGUOUS_SITE = """
+from tests.testapp.models import Book
+
+
+def two_of_them():
+    for book in Book.objects.all():
+        send(book.publisher.name, book.author.name)
+"""
+
+COVERED_SITE = """
+from tests.testapp.models import Book
+
+
+def covered():
+    for book in Book.objects.select_related("publisher"):
+        send(book.publisher.name)
+"""
+
+
+def ghost_site():
+    """A call site for a model this run has no vocabulary for.
+
+    Not contrived: a scan of a project whose app registry the command was
+    pointed at only part of produces exactly this, and the relation can never
+    be named from it.
+    """
+    from django_fk_optimize.utils.callsites import CallSite
+
+    return CallSite(
+        path=FILE,
+        line=4,
+        model="ghosts.Ghost",
+        kind="iteration",
+        expression="Ghost.objects.all()",
+        touched=("haunts",),
+        function="haunting",
+        scope_start=3,
+        scope_end=9,
+    )
+
+
+def _no_site(vocabulary):
+    return [], lookup(PUBLISHERS, line=500, count=31, function="people")
+
+
+def _unknown_table(vocabulary):
+    return [], lookup("some_other_database_table", line=500, count=32)
+
+
+def _site_no_table_confirm_ambiguous(vocabulary):
+    sites = sites_for(AMBIGUOUS_SITE, vocabulary)
+    touch = line_of(AMBIGUOUS_SITE, "book.publisher.name")
+    return sites, lookup(TAGS, line=touch, count=33)
+
+
+def _site_no_table_confirm_sole_candidate(vocabulary):
+    sites = sites_for(SIMPLE, vocabulary)
+    touch = line_of(SIMPLE, "book.publisher.name")
+    return sites, lookup(AUTHORS, line=touch, count=34)
+
+
+def _site_with_hints_covering_everything(vocabulary):
+    sites = sites_for(COVERED_SITE, vocabulary)
+    touch = line_of(COVERED_SITE, "book.publisher.name")
+    return sites, lookup(PUBLISHERS, line=touch, count=35)
+
+
+def _site_with_a_path_shaped_touch(vocabulary):
+    sites = sites_for(TWO_HOP, vocabulary)
+    touch = line_of(TWO_HOP, "favourite_publisher.name")
+    return sites, lookup(AUTHORS, line=touch, count=36)
+
+
+def _site_whose_model_is_not_in_the_vocabulary(vocabulary):
+    return [ghost_site()], lookup(PUBLISHERS, line=5, count=37)
+
+
+AWKWARD = {
+    "no site at all": _no_site,
+    "a table no model claims": _unknown_table,
+    "a site whose table did not confirm, two candidates": (
+        _site_no_table_confirm_ambiguous
+    ),
+    "a site whose table did not confirm, one candidate": (
+        _site_no_table_confirm_sole_candidate
+    ),
+    "a site that already hints the relation": _site_with_hints_covering_everything,
+    "a site whose touch is a path": _site_with_a_path_shaped_touch,
+    "a site for a model nobody described": _site_whose_model_is_not_in_the_vocabulary,
+}
+
+
+def speaks_for(verdict, group) -> bool:
+    """Whether this verdict is carrying that group's evidence.
+
+    Either it quotes the recorded query count outright or its N came from the
+    recording and is that count. A verdict that does neither is about
+    something else and does not discharge the group.
+    """
+    return verdict.observed_queries == group.count or (
+        verdict.rows.provenance == V.OBSERVED and verdict.rows.n == group.count
+    )
+
+
+@pytest.mark.parametrize("shape", list(AWKWARD))
+def test_no_observed_n_plus_one_is_ever_dropped_in_silence(shape, vocabulary, tables):
+    """The invariant, over every awkward outcome the join has.
+
+    A group that matched a scope but could not be named produced no verdict at
+    all: not a finding, not a runtime-only finding, not an unattributed one.
+    It was still counted in `findings_matched`, which the coverage block prints
+    as "traced N to a call site", so the report said it had understood the very
+    thing it had just lost. Verified on a real project: a 120-query group under
+    a half-applied select_related() came out as `matched: 1, actionable: 0`
+    beside the words "no change worth making".
+
+    Every branch of the join therefore has to end somewhere a reader can see:
+    a verdict carrying the group's numbers, or the unattributed list, which the
+    report prints as "to no model at all". Silence is not one of the options.
+    """
+    sites, group = AWKWARD[shape](vocabulary)
+    assert group.is_n_plus_one, "the fixture has to be a finding in the first place"
+
+    verdicts, result = V.build(
+        sites, [group, bulk(BOOKS), bulk(PUBLISHERS)], vocabulary, tables
+    )
+
+    spoken = [verdict for verdict in verdicts if speaks_for(verdict, group)]
+    assert spoken or group in result.unattributed, (
+        f"{shape}: the group was counted as "
+        f"{'matched' if result.matched else 'runtime-only'} and then said nothing"
+    )
+
+
+def test_a_matched_group_nobody_can_name_still_prints_its_candidates(
+    vocabulary, tables
+):
+    """Scope matched, table did not, and two relations at the site could have.
+
+    The site touches Book.publisher and Book.author and neither of them is the
+    imprint table, so nothing at the call site names the query -- but something
+    in the project points there, and saying which is the only help available.
+    """
+    sites = sites_for(AMBIGUOUS_SITE, vocabulary)
+    touch = line_of(AMBIGUOUS_SITE, "book.publisher.name")
+    group = lookup(IMPRINTS, line=touch, count=38)
+
+    verdicts, result = V.build(sites, [group, bulk(BOOKS)], vocabulary, tables)
+
+    assert len(result.matched) == 1 and result.matched[0].relation == ""
+    (finding,) = [verdict for verdict in verdicts if speaks_for(verdict, group)]
+    assert finding.observed_queries == 38
+    assert finding.confidence == PROBABLE
+    assert finding.actionable is False, "there is no relation to assert a fix for"
+    assert finding.file == FILE, "the call site is attached; it is what got traced"
+    assert finding.function == "two_of_them"
+    assert finding.candidates == ("testapp.Series.imprint",)
+    assert any("did not confirm" in note for note in finding.notes)
+
+
+def test_a_matched_group_with_no_candidate_at_all_is_still_printed(vocabulary, tables):
+    """Nothing points at the tag table with a forward FK; it is still a finding."""
+    sites, group = _site_no_table_confirm_ambiguous(vocabulary)
+
+    verdicts, _ = V.build(sites, [group, bulk(BOOKS)], vocabulary, tables)
+
+    (finding,) = [verdict for verdict in verdicts if speaks_for(verdict, group)]
+    assert finding.candidates == ()
+    assert any("only lead" in note for note in finding.notes)
+
+
+def test_the_half_applied_hint_that_started_this(vocabulary, tables):
+    """A two-hop chain with the first hop hinted, and 120 queries recorded.
+
+    Both halves of the bug in one place: the path was invisible to the verdict
+    loop, so the observed group had nothing to attach to and disappeared.
+    """
+    source = """
+from tests.testapp.models import Book
+
+
+def listing():
+    for book in Book.objects.select_related("author"):
+        send(book.author.favourite_publisher.name)
+"""
+    sites = sites_for(source, vocabulary)
+    touch = line_of(source, "favourite_publisher.name")
+
+    verdicts, result = V.build(
+        sites, [lookup(PUBLISHERS, line=touch, count=120)], vocabulary, tables
+    )
+
+    assert len(result.matched) == 1
+    findings = [verdict for verdict in verdicts if verdict.actionable]
+    assert len(findings) == 1, [verdict.kind for verdict in verdicts]
+    assert findings[0].relation == "author__favourite_publisher"
+    assert findings[0].rows == V.Rows(120, V.OBSERVED)
+    # The hint already on the line is left where it is -- chained
+    # select_related() calls accumulate -- and the one that carries both hops
+    # is added beside it.
+    assert findings[0].fix.endswith('.select_related("author__favourite_publisher")')
+
+
 CHAIN = """
 from testapp.models import Book
 

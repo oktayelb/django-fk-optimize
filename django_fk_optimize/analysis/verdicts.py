@@ -42,7 +42,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 
 from django.db import DatabaseError
@@ -322,6 +322,15 @@ def join(groups, sites, vocabulary, tables) -> JoinResult:
             continue
         match = _match(group, by_file, vocabulary, tables)
         if match is not None:
+            if not match.named:
+                # The scope matched and nothing could name the relation. The
+                # candidates are the only thing left to print, and printing
+                # them is not optional: without them `build()` has a matched
+                # group it cannot say anything about, and a group nobody can
+                # say anything about is a group that vanishes.
+                match = replace(
+                    match, candidates=_infer(group, vocabulary, tables, parents)
+                )
             result.matched.append(match)
             continue
         candidates = _infer(group, vocabulary, tables, parents)
@@ -801,6 +810,14 @@ def build(
         verdicts.extend(
             _site_verdicts(site, observed, vocabulary, cardinality, sample_size)
         )
+    # A matched group whose numbers no site verdict read would otherwise leave
+    # no trace at all: it is counted in `findings_matched`, the coverage block
+    # prints it as traced to a call site, and the finding itself is gone. That
+    # is the one failure mode this tool cannot afford, so the group gets a
+    # verdict here even when nothing can name the relation it came from.
+    for match in result.matched:
+        if (id(match.site), match.relation) not in observed.claimed:
+            verdicts.append(_unclaimed_verdict(match))
     for match in result.runtime_only:
         verdicts.append(_runtime_verdict(match))
 
@@ -1127,6 +1144,65 @@ def _runtime_verdict(match: Match) -> Verdict:
             "several relations point at this table; the candidates are listed",
         )
     fit(verdict)
+    return verdict
+
+
+def _unclaimed_verdict(match: Match) -> Verdict:
+    """A matched group no site verdict spoke for.
+
+    The scope matched -- so there is a call site, and it is printed -- but the
+    table did not confirm any relation the site touches and no single uncovered
+    one could be deduced either.  Every other outcome of the join ends in a
+    verdict; without this one a recorded N+1 would be counted as traced in the
+    coverage block and then never mentioned again, which reads to the person
+    running the command as "nothing to do here".
+
+    Reported at `probable` with the candidates listed and no fix asserted:
+    there is real evidence that this loop costs N queries, and no evidence at
+    all about which relation to hint.  Those are different claims and only the
+    first is being made.
+    """
+    group = match.group
+    site = match.site
+    verdict = Verdict(
+        kind=N_PLUS_ONE,
+        model=match.model or "",
+        relation=match.relation,
+        rows=Rows(group.count, OBSERVED),
+        confidence=PROBABLE,
+        actionable=bool(match.named),
+        file=site.path if site is not None else group.attribution.file,
+        line=site.line if site is not None else group.attribution.line,
+        function=site.function if site is not None else group.attribution.function,
+        expression=expression_of(site),
+        source=group.source,
+        observed_queries=group.count,
+        observed_seconds=group.seconds,
+        observed_invocations=group.invocations,
+        candidates=tuple(f"{label}.{name}" for label, name in match.candidates),
+        notes=site.notes if site is not None else (),
+    )
+    verdict.headline = (
+        f"{group.count} extra queries from this scope; "
+        "nothing here names the relation they came from"
+    )
+    verdict.notes = verdict.notes + (
+        "the enclosing scope matched but the table did not confirm any relation "
+        "this site touches",
+    )
+    verdict.notes = verdict.notes + (
+        "the candidates are every forward relation in the project that points at "
+        f"that table ({group.table})"
+        if match.candidates
+        # Worth saying out loud rather than leaving a blank line: a table
+        # nothing has a forward relation to was reached some other way -- a
+        # manager consumed per row, a raw query, a generic foreign key -- and
+        # the call site above is the only lead there is.
+        else f"nothing in this project has a forward relation to {group.table}, so "
+        "the call site is the only lead",
+    )
+    if match.named:
+        fit(verdict)
     return verdict
 
 
