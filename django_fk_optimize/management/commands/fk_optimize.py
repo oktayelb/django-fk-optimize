@@ -332,6 +332,20 @@ class Command(BaseCommand):
 
         deadline = Deadline(options["timeout"])
         if not options["callsites"]:
+            if options["json"] is not None:
+                # The sweep has no verdicts to serialise -- it reports what
+                # each relation costs, not what to do about it -- and the two
+                # were wired in such an order that `--no-callsites --json out`
+                # printed the text sweep, wrote no file, and exited 0.  A CI
+                # step asking for a machine-readable report and receiving
+                # silence and a success is the worst of the three ways this
+                # could go, so it is the one thing it must not do.
+                raise CommandError(
+                    "--json has nothing to write under --no-callsites: the "
+                    "sweep times relations and produces no verdicts. Drop "
+                    "--no-callsites for the JSON report, or drop --json for "
+                    "the sweep."
+                )
             self._sweep(model_s, deadline)
             return
         self._report(

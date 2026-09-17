@@ -744,3 +744,22 @@ def test_the_gate_opens_when_nothing_has_evidence_behind_it(capsys):
     )
 
     assert "2 actionable findings not counted" in capsys.readouterr().err
+
+
+def test_json_under_no_callsites_says_so_instead_of_writing_nothing(tmp_path):
+    """The sweep has no verdicts, so --json must refuse rather than no-op.
+
+    These two options were wired in an order that made the combination print
+    the text sweep, write no file and exit 0.  A CI step that asked for a
+    machine-readable report, got none, and was told everything went fine is a
+    worse outcome than either doing the work or refusing it.
+    """
+    destination = tmp_path / "out.json"
+
+    with pytest.raises(CommandError) as raised:
+        call_command(
+            "fk_optimize", "testapp.Book", "--no-callsites", "--json", str(destination)
+        )
+
+    assert "--no-callsites" in str(raised.value)
+    assert not destination.exists()
