@@ -366,3 +366,68 @@ def test_the_confidence_column_never_collides_with_the_saving():
     )
     assert "queriesconfidence" not in line
     assert "  confidence:" in line
+
+
+# ----------------------------------------------------------------------
+# how much of one call, and over how many
+# ----------------------------------------------------------------------
+
+
+def test_an_observed_n_says_how_many_calls_it_was_taken_over():
+    """N is a median across invocations, and a median of one is an anecdote."""
+    text = text_of(
+        [finding(observed_invocations=37)], report.Coverage(recording_exists=True)
+    )
+
+    assert "rows        412  (observed)  median of 37 calls" in text
+
+
+def test_a_single_invocation_is_not_dressed_up_as_a_pattern():
+    text = text_of(
+        [finding(observed_invocations=1)], report.Coverage(recording_exists=True)
+    )
+
+    assert "412  (observed)  one call only" in text
+
+
+def test_an_estimate_has_no_invocations_to_claim():
+    """A row count is not a median of anything, whatever the field holds."""
+    verdict = finding(rows=Rows(500, ESTIMATED), observed_invocations=9)
+
+    text = text_of([verdict], report.Coverage(recording_exists=True))
+
+    assert "rows        500  (estimated)" in text
+    assert "calls" not in text
+
+
+def test_the_recording_says_how_many_runs_it_holds():
+    coverage = report.Coverage(
+        recording_exists=True,
+        recording_path="rec.jsonl",
+        records=4812,
+        groups=88,
+        recording_invocations=37,
+    )
+
+    text = text_of([], coverage)
+
+    assert "4812 records over 37 invocations," in text
+
+
+def test_a_recording_with_no_run_count_does_not_invent_one():
+    coverage = report.Coverage(recording_exists=True, records=12)
+
+    assert "12 records, 0 malformed" in text_of([], coverage)
+
+
+def test_json_carries_the_reach_of_the_observation():
+    payload = json.loads(
+        report.dumps([finding(observed_invocations=37)], report.Coverage())
+    )
+
+    (verdict,) = payload["verdicts"]
+    assert verdict["observed"] == {
+        "queries": 412,
+        "seconds": 0.3402,
+        "invocations": 37,
+    }

@@ -386,9 +386,15 @@ class Verdict:
     source: str = PYTHON
     runtime_only: bool = False
 
-    # what it costs now, as recorded
+    # What it costs now, as recorded -- per invocation, both of them.  A whole
+    # recording's worth of queries printed beside "per call" is the number
+    # nobody can act on: it moves with how long the recording ran.
     observed_queries: int | None = None
     observed_seconds: float | None = None
+    # How many invocations that median was taken over.  An N seen once is a
+    # weaker claim than the same N seen on thirty-seven page loads, and a
+    # report that prints them identically is hiding the difference.
+    observed_invocations: int = 0
 
     # what it costs now and what it could cost, as measured
     current: Measurement | None = None
@@ -895,7 +901,8 @@ def _runtime_verdict(match: Match) -> Verdict:
         source=group.source,
         runtime_only=True,
         observed_queries=group.count,
-        observed_seconds=group.total_seconds,
+        observed_seconds=group.seconds,
+        observed_invocations=group.invocations,
         candidates=tuple(f"{label}.{name}" for label, name in match.candidates),
     )
     where = {

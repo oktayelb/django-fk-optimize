@@ -363,6 +363,7 @@ class Command(BaseCommand):
             records=recording.count,
             malformed=recording.malformed,
             groups=len(groups),
+            recording_invocations=recording.invocations,
             recording_age_seconds=recording.age_seconds,
             findings_matched=len(joined.matched),
             findings_runtime_only=len(joined.runtime_only),

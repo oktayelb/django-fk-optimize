@@ -28,7 +28,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
-from .verdicts import ACTIONABLE_KINDS, MEASURED, REMOVE_HINT, Verdict
+from .verdicts import ACTIONABLE_KINDS, MEASURED, OBSERVED, REMOVE_HINT, Verdict
 
 SCHEMA_VERSION = 1
 
@@ -67,6 +67,9 @@ class Coverage:
     records: int = 0
     malformed: int = 0
     groups: int = 0
+    # How many distinct runs the recording holds.  Every per-call number in the
+    # report above is a median over these, and one invocation is one anecdote.
+    recording_invocations: int = 0
     recording_age_seconds: float | None = None
 
     findings_matched: int = 0
@@ -209,10 +212,37 @@ def _saving(verdict: Verdict) -> str:
     return f"{saved:<48}  {confidence}"
 
 
+def _over(invocations: int) -> str:
+    """How many invocations an observed N was taken over.
+
+    Said out loud, because N is a median and a median of one is a single page
+    load that happened to be recorded.  Printing "412 (observed)" for that and
+    for the same figure seen on thirty-seven requests hides the difference
+    between an anecdote and a pattern.  Zero means the number came from
+    somewhere that does not count invocations, and claims nothing.
+    """
+    if invocations <= 0:
+        return ""
+    if invocations == 1:
+        return "one call only"
+    return f"median of {invocations} calls"
+
+
 def _block(verdict: Verdict) -> list[tuple[str, str]]:
     lines: list[tuple[str, str]] = [("", PLAIN), (_header(verdict), HEADING)]
     if verdict.rows.known:
-        lines.append(_row("rows", f"{verdict.rows.n}  ({verdict.rows.provenance})"))
+        # Only an observed N was taken over invocations; an estimate is a count
+        # of table rows and has nothing to average.
+        over = (
+            _over(verdict.observed_invocations)
+            if verdict.rows.provenance == OBSERVED
+            else ""
+        )
+        # The provenance stays in its own parentheses and the reach follows it,
+        # rather than being folded in: "(observed)" is the phrase the rest of
+        # the world greps this report for.
+        rows = f"{verdict.rows.n}  ({verdict.rows.provenance})"
+        lines.append(_row("rows", f"{rows}  {over}".rstrip()))
     lines.append(_row("what", verdict.headline))
     current = _current(verdict)
     if current != "unknown":
@@ -278,11 +308,18 @@ def _coverage(coverage: Coverage) -> list[tuple[str, str]]:
         lines.append(_row("scanned", "nothing (--no-callsites)"))
 
     if coverage.recording_exists:
+        # Every N above is a median over these invocations, so how many there
+        # were bounds the whole report: one run is one page load's luck.
+        over = (
+            f" over {plural(coverage.recording_invocations, 'invocation')}"
+            if coverage.recording_invocations
+            else ""
+        )
         lines.append(
             _row(
                 "recording",
                 f"{relative(coverage.recording_path)}  "
-                f"{plural(coverage.records, 'record')}, "
+                f"{plural(coverage.records, 'record')}{over}, "
                 f"{coverage.malformed} malformed, "
                 f"{plural(coverage.groups, 'query group')}, "
                 f"{age(coverage.recording_age_seconds)}",
@@ -405,6 +442,8 @@ def verdict_json(verdict: Verdict) -> dict:
         "observed": {
             "queries": verdict.observed_queries,
             "seconds": verdict.observed_seconds,
+            # Both of the above are per invocation; this is how many.
+            "invocations": verdict.observed_invocations,
         },
         "current": _measurement(verdict.current),
         "best": {
