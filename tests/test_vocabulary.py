@@ -142,3 +142,80 @@ def test_from_apps_covers_the_test_app():
     assert "tags" in book.relations, "manager relations are covered now too"
     # django.* apps are excluded by default.
     assert "contenttypes.ContentType" not in vocabulary
+
+
+# -- walking a relation path -------------------------------------------
+#
+# `publisher__country` is what the hint takes and what the fix prints, so the
+# vocabulary has to be able to walk one: the analysis layer decides between
+# select_related() and prefetch_related() from the kind of *every* hop, and a
+# path is only joinable when none of them is a manager.
+
+
+def test_resolve_path_walks_one_hop():
+    vocabulary = Vocabulary.from_apps()
+
+    relation = vocabulary.resolve_path("testapp.Book", "publisher")
+
+    assert relation is not None
+    assert relation.target == "testapp.Publisher"
+
+
+def test_resolve_path_answers_with_the_last_hop():
+    """`.target` is where the path arrives, not where it set off."""
+    vocabulary = Vocabulary.from_apps()
+
+    relation = vocabulary.resolve_path("testapp.Series", "imprint__publisher")
+
+    assert relation.name == "publisher"
+    assert relation.target == "testapp.Publisher"
+    assert relation.kind == vocabulary_module.FORWARD
+
+
+def test_resolve_path_reports_the_kind_of_the_final_hop():
+    """A path through a many-to-many cannot be joined, whatever precedes it."""
+    vocabulary = Vocabulary.from_apps()
+
+    relation = vocabulary.resolve_path("testapp.Publisher", "book_set__tags")
+
+    assert relation.kind == vocabulary_module.MANY_TO_MANY
+    assert relation.joinable is False
+
+
+def test_resolve_path_refuses_an_unwalkable_path():
+    vocabulary = Vocabulary.from_apps()
+
+    assert vocabulary.resolve_path("testapp.Book", "publisher__nope") is None
+    assert vocabulary.resolve_path("testapp.Book", "nope__publisher") is None
+    assert vocabulary.resolve_path("testapp.Nothing", "publisher") is None
+    assert vocabulary.resolve_path("testapp.Book", "") is None
+
+
+def test_resolve_path_stops_at_a_model_it_does_not_know():
+    """A hop over the edge of the vocabulary is not a shorter path."""
+    book = ModelInfo(
+        label="testapp.Book",
+        name="Book",
+        module="testapp.models",
+        relations={"publisher": Relation("publisher", "publisher_id", "other.Press")},
+    )
+    vocabulary = Vocabulary(models={"testapp.Book": book})
+
+    assert vocabulary.resolve_path("testapp.Book", "publisher") is not None
+    assert vocabulary.resolve_path("testapp.Book", "publisher__country") is None
+
+
+def test_resolve_hops_hands_back_every_hop():
+    """Every hop, because one manager anywhere in the path forbids a join."""
+    vocabulary = Vocabulary.from_apps()
+
+    hops = vocabulary.resolve_hops("testapp.Series", "imprint__publisher__book_set")
+
+    assert [hop.name for hop in hops] == ["imprint", "publisher", "book_set"]
+    assert [hop.joinable for hop in hops] == [True, True, False]
+
+
+def test_resolve_hops_is_all_or_nothing():
+    vocabulary = Vocabulary.from_apps()
+
+    assert vocabulary.resolve_hops("testapp.Series", "imprint__nope") is None

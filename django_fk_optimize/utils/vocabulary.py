@@ -156,6 +156,46 @@ class Vocabulary:
         found = self._by_name.get(name) or []
         return found[0] if len(found) == 1 else None
 
+    def resolve_hops(self, label: str, path: str) -> tuple[Relation, ...] | None:
+        """Every relation a `__` path crosses, from the model `label` outwards.
+
+        `publisher__country` on a Book is two relations, not one, and the
+        difference decides whether a hint is legal at all: select_related() can
+        only be offered when *every* hop is joinable, so a caller that sees
+        only the last one would happily propose a join through a many-to-many.
+        Returning the hops rather than a verdict keeps that decision where the
+        relation kinds are understood.
+
+        None -- never a partial tuple -- when any hop is not a relation of the
+        model it is read off, or when an intermediate model is not in this
+        vocabulary.  A half-walked path is a guess about the rest, and the
+        whole point of a closed vocabulary is not having to guess.  The *final*
+        hop's target is allowed to be unknown, because nothing is read off it.
+        """
+        info = self.models.get(label)
+        hops: list[Relation] = []
+        for segment in path.split("__"):
+            if info is None:
+                return None
+            relation = info.relation(segment)
+            if relation is None:
+                return None
+            hops.append(relation)
+            info = self.models.get(relation.target)
+        return tuple(hops) or None
+
+    def resolve_path(self, label: str, path: str) -> Relation | None:
+        """The relation a `__` path ends at, or None if it cannot be walked.
+
+        The answer is the *last* hop, so `.target` is the model the path
+        arrives at and `.kind` is how that final relation behaves -- which is
+        what decides select_related() against prefetch_related() for the path
+        as a whole, since a single manager hop anywhere makes the join illegal.
+        Use resolve_hops() when the hops in between matter too.
+        """
+        hops = self.resolve_hops(label, path)
+        return hops[-1] if hops else None
+
     def __contains__(self, label):
         return label in self.models
 
